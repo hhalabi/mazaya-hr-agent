@@ -1,0 +1,11 @@
+.watermark {
+    display: none !important;
+  }
+  
+  .relative.flex.flex-col.items-center.gap-2.w-full {
+    transform: translateY(-10px) !important; /* Adjust the value as needed */
+  }
+  
+  body div.relative.hidden.bg-muted.lg\:block img[src*="favicon"] {
+    display: none; /* Hide the favicon image */
+  }

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Mazaya Benefits Agent (LangGraph + LangMem + PostgresStore)
+Mazaya Benefits Agent (LangGraph + LangMem + PostgresStore) with STREAMING
 
-Supports the official Mazaya Excel schema:
-  OfferID, Company Name, Offer Name En, Offer Name Ar, Offer Details En, Offer Details Ar,
-  Effective, Discontinue, Unlimited, Country, Cities, Category En, Category Ar, Status
+- Supports the official Mazaya Excel (Active.xlsx) and the older internal sheet
+- Long-term memory persisted in Postgres (optionally with pgvector)
+- Short-term per-thread memory via SQLite checkpointer
+- Token streaming via LangGraph `stream_events` (prints tokens as they arrive)
 
-Also supports the previous internal sheet:
-  Category, CardName, Title, Offer, Location, Duration, Contact, Website, Offer_URL
-
-Run:
+Run (env):
   export OPENAI_API_KEY="YOUR_OPENAI_KEY_HERE"
   export PG_CONN="postgresql://postgres:postgres@localhost:5432/mazaya_mem"
-  python mazaya_agent_pg.py --csv_or_xlsx ./Active.xlsx --user-id hamza --thread-id t1
+
+Run (script):
+  python mazaya_agent_pg_streaming.py --csv_or_xlsx ./Active.xlsx --user-id hamza --thread-id t1 --stream
 """
 
 import os
@@ -117,7 +117,6 @@ class BenefitsIndex:
     def _load_frame(path: str) -> pd.DataFrame:
         ext = path.lower().split(".")[-1]
         if ext in ("xlsx", "xls"):
-            # openpyxl is required for .xlsx
             return pd.read_excel(path, sheet_name=0, engine="openpyxl")
         elif ext == "csv":
             return pd.read_csv(path, encoding="utf-8")
@@ -174,7 +173,6 @@ class BenefitsIndex:
 
             # Title/Description
             title = name_en or name_ar or provider or "(no title)"
-            # Merge EN/AR details for searchability; show EN first
             description = det_en
             if det_ar:
                 description = f"{description} | {det_ar}" if description else det_ar
@@ -190,13 +188,12 @@ class BenefitsIndex:
             # Location
             location = _join_locs(country, cities)
 
-            # Tags: categories (EN/AR tokens) + city tokens
+            # Tags
             tags_set = set()
             for t in _split_tokens(cat_en) + _split_tokens(cat_ar):
                 tags_set.add(t.lower())
             for city in _split_tokens(cities):
                 tags_set.add(city.lower())
-            # Add simple hints from names
             name_hint = (name_en or name_ar).lower() if (name_en or name_ar) else ""
             if "women" in name_hint or "نسائي" in name_hint:
                 tags_set.add("women")
@@ -211,11 +208,11 @@ class BenefitsIndex:
                 "description": description,
                 "location": location,
                 "duration": duration,
-                "contact": "",     # not provided in official sheet
-                "website": "",     # not provided in official sheet
-                "url": "",         # not provided in official sheet
+                "contact": "",
+                "website": "",
+                "url": "",
                 "tags": ", ".join(sorted(tags_set)),
-                # keep hidden fields to widen search (not exposed directly)
+                # hidden fields for search breadth
                 "_name_ar": name_ar,
                 "_details_ar": det_ar,
                 "_cat_ar": cat_ar,
@@ -387,7 +384,7 @@ def search_benefits(query: str = "", filters_json: str = "", limit: int = 12) ->
     except Exception:
         filters = {}
     rows = _BENEFITS_INDEX.search(query=query, filters=filters, limit=limit)
-    return json.dumps({"results": rows})
+    return json.dumps({"results": rows}, ensure_ascii=False, indent=2)
 
 @tool("recommend_benefits", return_direct=False)
 def recommend_benefits(preferences_json: str = "", limit: int = 8) -> str:
@@ -402,9 +399,9 @@ def recommend_benefits(preferences_json: str = "", limit: int = 8) -> str:
     except Exception:
         prefs = {}
     rows = _BENEFITS_INDEX.recommend(prefs, limit=limit)
-    return json.dumps({"results": rows, "used_prefs": prefs})
+    return json.dumps({"results": rows, "used_prefs": prefs}, ensure_ascii=False, indent=2)
 
-# Optional deterministic memory save tool (kept; handy in demos/tests)
+# Optional deterministic memory save tool (handy in demos/tests)
 @tool("remember_traits", return_direct=False)
 def remember_traits(json_payload: str) -> str:
     """
@@ -425,7 +422,6 @@ def remember_traits(json_payload: str) -> str:
         merged = current.value["content"]
     elif current and isinstance(current.value, dict):
         merged = current.value
-    # shallow merge
     merged.update(data)
     store.put(ns, "profile", {"content": merged}, index={"text": json.dumps(merged, ensure_ascii=False)})
     return "Saved."
@@ -489,9 +485,11 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore):
         store=store,
     )
 
+    # Important: enable streaming at the model level (helps token events)
     llm = ChatOpenAI(
         model="gpt-5-mini",
         temperature=0.3,
+        streaming=True,  # <-- enables token callbacks
         # api_key=os.environ.get("OPENAI_API_KEY", "YOUR_OPENAI_KEY_HERE"),
     )
 
@@ -506,10 +504,78 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore):
 
 
 # =========================
-# CLI / example usage
+# CLI (with streaming)
 # =========================
 
-def run_cli_loop(agent, args):
+def _extract_text_from_chunk(chunk) -> str:
+    """
+    Robustly extract text from a ChatOpenAI stream chunk.
+    """
+    try:
+        # langchain messages: AIMessageChunk with .content
+        text = getattr(chunk, "content", None)
+        if isinstance(text, str):
+            return text
+        if isinstance(text, list):
+            # content could be a list of parts; concat any 'text' fields
+            out = []
+            for part in text:
+                if isinstance(part, dict) and "text" in part:
+                    out.append(part["text"])
+                else:
+                    out.append(str(part))
+            return "".join(out)
+        # fallback
+        return str(chunk)
+    except Exception:
+        return ""
+
+def run_cli_loop_streaming(agent, args):
+    print("\nMazaya Benefits Agent (streaming). Type your question (Ctrl+C to exit).\n")
+    while True:
+        try:
+            user = input("You: ").strip()
+            if not user:
+                continue
+
+            config = {
+                "configurable": {
+                    "langgraph_user_id": args.user_id,  # long-term namespace key
+                    "thread_id": args.thread_id,        # short-term (checkpoint) key
+                }
+            }
+
+            print("\nAgent: ", end="", flush=True)
+
+            # Stream ONLY LLM tokens (use "updates" if you want step-by-step progress instead)
+            for msg, meta in agent.stream(
+                {"messages": [{"role": "user", "content": user}]},
+                config=config,
+                stream_mode="messages",  # token stream
+            ):
+                # With prebuilt create_react_agent, the LLM node name is "agent"
+                # Filter so you don't print tool/other-node tokens if you later add more LLMs.
+                if meta.get("langgraph_node") != "agent":
+                    continue
+
+                # msg is a MessageChunk; print incremental text as it arrives
+                if hasattr(msg, "content"):
+                    if isinstance(msg.content, str):
+                        print(msg.content, end="", flush=True)
+                    elif isinstance(msg.content, list):
+                        # content can be list of parts; concat text-like parts
+                        for part in msg.content:
+                            if isinstance(part, dict) and "text" in part:
+                                print(part["text"], end="", flush=True)
+
+            print("")  # newline after full answer
+
+        except KeyboardInterrupt:
+            print("\nBye!")
+            break
+
+
+def run_cli_loop_blocking(agent, args):
     print("\nMazaya Benefits Agent ready. Type your question (Ctrl+C to exit).\n")
     while True:
         try:
@@ -518,8 +584,8 @@ def run_cli_loop(agent, args):
                 continue
             config = {
                 "configurable": {
-                    "langgraph_user_id": args.user_id,  # long-term namespace key
-                    "thread_id": args.thread_id,        # short-term (checkpoint) key
+                    "langgraph_user_id": args.user_id,
+                    "thread_id": args.thread_id,
                 }
             }
             out = agent.invoke({"messages": [{"role": "user", "content": user}]}, config=config)
@@ -528,18 +594,20 @@ def run_cli_loop(agent, args):
             print("\nBye!")
             break
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv_or_xlsx", required=True, help="Path to Mazaya offers XLSX/CSV")
     parser.add_argument("--user-id", required=True, help="Stable user ID for long-term memory namespace")
     parser.add_argument("--thread-id", default="default", help="Conversation thread (short-term memory scope)")
     parser.add_argument("--pg-conn", default=os.getenv("PG_CONN", "postgresql://postgres:postgres@localhost:5432/mazaya_mem"))
+    parser.add_argument("--stream", action="store_true", help="Enable token streaming to stdout")
     args = parser.parse_args()
 
     # ---- Persistent long-term memory store (Postgres) ----
     with PostgresStore.from_conn_string(
         args.pg_conn,
-        index={"dims": 1536, "embed": "openai:text-embedding-3-small"}  # requires pgvector; set to None if not available
+        index={"dims": 1536, "embed": "openai:text-embedding-3-small"}  # set to None if pgvector not available
         # index=None
     ) as store:
         try:
@@ -551,11 +619,17 @@ def main():
         if _HAS_SQLITE:
             with SqliteSaver.from_conn_string("mazaya_checkpoints.db") as checkpointer:
                 agent = build_agent(args.csv_or_xlsx, checkpointer=checkpointer, store=store)
-                run_cli_loop(agent, args)
+                if args.stream:
+                    run_cli_loop_streaming(agent, args)
+                else:
+                    run_cli_loop_blocking(agent, args)
         else:
             checkpointer = MemorySaver()
             agent = build_agent(args.csv_or_xlsx, checkpointer=checkpointer, store=store)
-            run_cli_loop(agent, args)
+            if args.stream:
+                run_cli_loop_streaming(agent, args)
+            else:
+                run_cli_loop_blocking(agent, args)
 
 if __name__ == "__main__":
     main()
