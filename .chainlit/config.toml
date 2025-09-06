@@ -66,9 +66,9 @@ edit_message = true
 
 [UI]
 # Name of the assistant.
-name = "Assistant"
+name = "Mazaya Benefits Agent"
 
-# default_theme = "dark"
+default_theme = "light"
 
 # layout = "wide"
 
@@ -78,7 +78,7 @@ name = "Assistant"
 # description = ""
 
 # Chain of Thought (CoT) display mode. Can be "hidden", "tool_call" or "full".
-cot = "tool_call"
+cot = "full"
 
 # Specify a CSS file that can be used to customize the user interface.
 # The CSS file can be served from the public directory or via an external link.

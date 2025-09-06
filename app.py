@@ -142,7 +142,8 @@ async def on_chat_start():
         cl.user_session.set("ckpt_cm", ckpt_cm)
 
         await cl.Message(
-            content="👋 **Mazaya Benefits Agent** ready.\nAsk about offers by city/category/company, or share your preferences for personalized picks."
+            content="Hi!👋 I am your **Mazaya Benefits Agent**.\nAsk about offers by city/category, or share your preferences for personalized picks.",
+            author="Saudia",
         ).send()
 
     except Exception as e:
@@ -213,7 +214,17 @@ async def _finish_tool_step(tool_msg, steps_by_id: dict):
     step.output = out
     await cm.__aexit__(None, None, None)
 
-
+@cl.password_auth_callback
+def auth_callback(username: str, password: str):
+    # Fetch the user matching username from your database
+    # and compare the hashed password with the value stored in the database
+    if (username, password) == ("admin", "admin"):
+        return cl.User(
+            identifier="admin", metadata={"role": "admin", "provider": "credentials"}
+        )
+    else:
+        return None
+        
 @cl.on_message
 async def on_message(message: cl.Message):
     agent  = cl.user_session.get("agent")
@@ -222,7 +233,7 @@ async def on_message(message: cl.Message):
         await cl.Message(content="Agent not initialized. Please /restart the chat.").send()
         return
 
-    ai_msg = cl.Message(content="")
+    ai_msg = cl.Message(content="", author="Saudia")
 
     # tool_call_id -> (ctxmgr, step)
     open_steps: dict[str, tuple[cl.Step, cl.Step]] = {}

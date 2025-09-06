@@ -487,7 +487,7 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore):
 
     # Important: enable streaming at the model level (helps token events)
     llm = ChatOpenAI(
-        model="gpt-5-mini",
+        model="gpt-4.1-mini",
         temperature=0.3,
         streaming=True,  # <-- enables token callbacks
         # api_key=os.environ.get("OPENAI_API_KEY", "YOUR_OPENAI_KEY_HERE"),
