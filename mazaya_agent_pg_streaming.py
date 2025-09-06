@@ -470,11 +470,13 @@ If unsure, ask concise follow-ups. Keep answers clear and scoped to Mazaya.
 # Build the agent
 # =========================
 
-def build_agent(file_path: str, checkpointer, store: PostgresStore):
+def build_agent(file_path: str, checkpointer, store: PostgresStore, preloaded_rows: List[Dict[str, Any]] | None = None):
     global _BENEFITS_INDEX
-    _BENEFITS_INDEX = BenefitsIndex.from_file(file_path)
+    if preloaded_rows is None:
+        _BENEFITS_INDEX = BenefitsIndex.from_file(file_path)
+    else:
+        _BENEFITS_INDEX = BenefitsIndex(preloaded_rows)
 
-    # LangMem tools against persistent PostgresStore
     manage_memory_tool = create_manage_memory_tool(
         namespace=("memories", "{langgraph_user_id}", "profile"),
         schema=UserTraits,
@@ -485,20 +487,14 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore):
         store=store,
     )
 
-    # Important: enable streaming at the model level (helps token events)
-    llm = ChatOpenAI(
-        model="gpt-4.1-mini",
-        temperature=0.3,
-        streaming=True,  # <-- enables token callbacks
-        # api_key=os.environ.get("OPENAI_API_KEY", "YOUR_OPENAI_KEY_HERE"),
-    )
+    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3, streaming=True)
 
     agent = create_react_agent(
         llm,
         tools=[search_benefits, recommend_benefits, manage_memory_tool, search_memory_tool, remember_traits],
         prompt=system_prompt_with_memories,
-        store=store,           # persistent long-term store
-        checkpointer=checkpointer,  # per-thread short-term memory
+        store=store,
+        checkpointer=checkpointer,
     )
     return agent
 
@@ -507,28 +503,6 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore):
 # CLI (with streaming)
 # =========================
 
-def _extract_text_from_chunk(chunk) -> str:
-    """
-    Robustly extract text from a ChatOpenAI stream chunk.
-    """
-    try:
-        # langchain messages: AIMessageChunk with .content
-        text = getattr(chunk, "content", None)
-        if isinstance(text, str):
-            return text
-        if isinstance(text, list):
-            # content could be a list of parts; concat any 'text' fields
-            out = []
-            for part in text:
-                if isinstance(part, dict) and "text" in part:
-                    out.append(part["text"])
-                else:
-                    out.append(str(part))
-            return "".join(out)
-        # fallback
-        return str(chunk)
-    except Exception:
-        return ""
 
 def run_cli_loop_streaming(agent, args):
     print("\nMazaya Benefits Agent (streaming). Type your question (Ctrl+C to exit).\n")

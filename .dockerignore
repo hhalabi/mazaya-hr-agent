@@ -1,0 +1,11 @@
+.git
+__pycache__
+.pytest_cache
+*.pyc
+*.pyo
+*.pyd
+.env
+*.db
+# Keep Active.xlsx since the app defaults to it
+# Active.xlsx
+

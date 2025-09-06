@@ -9,8 +9,8 @@ Chainlit UI for the Mazaya Benefits Agent (Async + Clean Streaming + Tool Steps)
 - Works with your existing build_agent(file_path, checkpointer, store)
 
 ENV:
-  OPENAI_API_KEY         -> OpenAI key for gpt-5-mini
-  PG_CONN                -> postgresql://postgres:postgres@localhost:5432/mazaya_mem
+  OPENAI_API_KEY         -> OpenAI key for gpt-4.1-mini
+  PG_CONN                -> postgresql://postgres:postgres@localhost:5432/mazaya_mem (for both store & pg checkpointer)
   MAZAYA_DATA            -> /path/to/Active.xlsx
   CHECKPOINTER_BACKEND   -> "sqlite" (default) or "postgres"
   CHECKPOINT_DB          -> (sqlite) file, default "mazaya_checkpoints.db"
@@ -25,7 +25,7 @@ import uuid
 import json
 import traceback
 import chainlit as cl
-from langchain_core.messages import ToolMessage, AIMessage, HumanMessage, ToolMessageChunk, AIMessageChunk, HumanMessageChunk
+from langchain_core.messages import ToolMessage, AIMessageChunk
 
 # --- Async store for long-term memory (Postgres) ---
 from langgraph.store.postgres import AsyncPostgresStore
@@ -38,16 +38,20 @@ try:
 except Exception:
     _HAS_ASYNC_PG_CKPT = False
 
-# --- Import your agent builder (must accept file_path, checkpointer, store) ---
-try:
-    # streaming-enabled builder
-    from mazaya_agent_pg_streaming import build_agent
-except ImportError:
-    # non-streaming builder still OK; we stream at the graph level
-    from mazaya_agent_pg import build_agent
+from mazaya_agent_pg_streaming import build_agent
+
 
 
 # ---------- Helpers: open/close async resources ----------
+
+@cl.cache  # 1h cache; adjust as you like
+def load_benefits_rows_cached(file_path: str, file_mtime: float) -> list[dict]:
+    """
+    Parse/normalize the Mazaya Excel once, reuse across sessions.
+    Caching key = (file_path, file_mtime), so new uploads break the cache.
+    """
+    from mazaya_agent_pg_streaming import BenefitsIndex
+    return BenefitsIndex.from_file(file_path).rows
 
 def _pretty_json_text(value: str | dict | list, limit: int = 1200) -> str:
     if isinstance(value, (dict, list)):
@@ -122,13 +126,18 @@ async def on_chat_start():
             "dims": 1536,
             "embed": "openai:text-embedding-3-small",
         }
+        
+        mtime = os.path.getmtime(data_path)
+        # 1) cached, fast
+        rows = load_benefits_rows_cached(data_path, mtime)
+        print(f"[INFO] Loaded {len(rows)} benefits rows from cache.")
 
         # Open async Postgres store & async checkpointer
         store_cm, store = await _open_store(pg_conn, index_cfg)
         ckpt_cm, checkpointer = await _open_checkpointer(ckpt_backend, pg_conn, sqlite_file)
 
         # Build agent (loads the official Excel within your builder)
-        agent = build_agent(file_path=data_path, checkpointer=checkpointer, store=store)
+        agent = build_agent(file_path=data_path, checkpointer=checkpointer, store=store, preloaded_rows=rows)
 
         # Save in session
         cl.user_session.set("agent", agent)
@@ -150,69 +159,6 @@ async def on_chat_start():
         await cl.Message(content=f"Init error: {e}").send()
         traceback.print_exc()
 
-
-def _extract_tool_calls(msg_chunk) -> list:
-    """Return a normalized list of tool_calls: [{id, name, arguments}]"""
-    tc = []
-
-    # LangChain AIMessageChunk may accumulate tool_calls in additional_kwargs
-    ak = getattr(msg_chunk, "additional_kwargs", {}) or {}
-    if isinstance(ak, dict) and "tool_calls" in ak and isinstance(ak["tool_calls"], list):
-        for call in ak["tool_calls"]:
-            cid = call.get("id")
-            fn  = call.get("function", {})
-            name = fn.get("name") or call.get("name")
-            args = fn.get("arguments") or call.get("arguments")
-            tc.append({"id": cid, "name": name, "arguments": args})
-        return tc
-
-    # Some versions expose msg_chunk.tool_calls directly
-    direct = getattr(msg_chunk, "tool_calls", None)
-    if isinstance(direct, list):
-        for call in direct:
-            cid = call.get("id")
-            fn  = call.get("function", {})
-            name = fn.get("name") or call.get("name")
-            args = fn.get("arguments") or call.get("arguments")
-            tc.append({"id": cid, "name": name, "arguments": args})
-
-    return tc
-
-
-async def _start_tool_step(tool_call, steps_by_id: dict):
-    """Create a Chainlit Step for a tool call and keep it open until result arrives."""
-    name = tool_call.get("name") or "tool"
-    args = tool_call.get("arguments")
-    if not isinstance(args, str):
-        try:
-            args = json.dumps(args, ensure_ascii=False)
-        except Exception:
-            args = str(args)
-
-    cm = cl.Step(name=f"🔧 {name}", type="tool")
-    step = await cm.__aenter__()
-    step.input = (args[:800] + "…") if len(args) > 800 else args
-    steps_by_id[tool_call.get("id") or str(uuid.uuid4())] = (cm, step)
-
-
-async def _finish_tool_step(tool_msg, steps_by_id: dict):
-    """Fill the output of the corresponding tool step and close it."""
-    tid = getattr(tool_msg, "tool_call_id", None) or getattr(tool_msg, "id", None)
-    content = getattr(tool_msg, "content", "")
-    if not tid or tid not in steps_by_id:
-        return
-    cm, step = steps_by_id.pop(tid)
-    # Keep result concise
-    out = content
-    if isinstance(out, (dict, list)):
-        try:
-            out = json.dumps(out, ensure_ascii=False)[:1200]
-        except Exception:
-            out = str(out)[:1200]
-    else:
-        out = str(out)[:1200]
-    step.output = out
-    await cm.__aexit__(None, None, None)
 
 @cl.password_auth_callback
 def auth_callback(username: str, password: str):

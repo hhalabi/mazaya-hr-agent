@@ -1,0 +1,14 @@
+chainlit==2.5.5
+langchain-core
+langchain-openai
+langgraph
+langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
+langmem
+pandas
+openpyxl
+pydantic
+python-dotenv
+psycopg[binary]
+asyncpg
+
