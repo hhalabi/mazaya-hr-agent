@@ -59,10 +59,11 @@ def _pretty_json_text(value, limit: int = 1200) -> str:
 async def _open_store(pg_conn: str, index_cfg: dict | None):
     store_cm = AsyncPostgresStore.from_conn_string(pg_conn, index=index_cfg)
     store = await store_cm.__aenter__()
-    try:
-        await store.setup()
-    except Exception as e:
-        print(f"[WARN] store.setup(): {e}")
+    # Store setup is first time only; skip
+    # try:
+    #     await store.setup()
+    # except Exception as e:
+    #     print(f"[WARN] store.setup(): {e}")
     return store_cm, store
 
 async def _open_checkpointer(backend: str, pg_conn: str, sqlite_path: str):
@@ -72,10 +73,11 @@ async def _open_checkpointer(backend: str, pg_conn: str, sqlite_path: str):
             raise RuntimeError("AsyncPostgresSaver not available. Install langgraph-checkpoint-postgres.")
         ckpt_cm = AsyncPostgresSaver.from_conn_string(pg_conn)
         ckpt = await ckpt_cm.__aenter__()
-        try:
-            await ckpt.setup()
-        except Exception as e:
-            print(f"[WARN] checkpointer.setup(): {e}")
+        # Checkpointer setup is first time only; skip
+        # try:
+        #     await ckpt.setup()
+        # except Exception as e:
+        #     print(f"[WARN] checkpointer.setup(): {e}")
         return ckpt_cm, ckpt
     ckpt_cm = AsyncSqliteSaver.from_conn_string(sqlite_path)
     ckpt = await ckpt_cm.__aenter__()

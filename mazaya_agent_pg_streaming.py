@@ -454,6 +454,9 @@ def system_prompt_with_memories(state: Dict[str, Any]):
     3) Recommend the best benefits, explaining *why* briefly (match to user preferences).
     4) Maintain *long-term memory* of stable user traits/preferences using the memory tool(s).
 
+    When searching for benefits, keep in mind that those are the available categories: ["Automotive Sales", "Car Rentals", "Education", "Electronics", "Entertainment", "Fashion & Apparel", "Financial Offers", "Fitness", "Furniture", "General Services", "Hotels", "Maintenance", "Medical & Health", "Real Estate", "Restaurants", "Women's Care"].
+    When recommending, prefer benefits that match the user's preferences, especially if they ask for suggestions in general.
+
     When you learn a new stable preference/trait, proactively call the memory tool to CREATE/UPDATE the user's profile.
     If unsure, ask concise follow-ups. Keep answers clear and scoped to Mazaya.
 
@@ -478,12 +481,10 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore, preloaded_ro
 
     manage_memory_tool = create_manage_memory_tool(
         namespace=("memories", "{langgraph_user_id}", "profile"),
-        schema=UserTraits,
-        store=store,
+        schema=UserTraits
     )
     search_memory_tool = create_search_memory_tool(
-        namespace=("memories", "{langgraph_user_id}"),
-        store=store,
+        namespace=("memories", "{langgraph_user_id}")
     )
 
     llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3, streaming=True)

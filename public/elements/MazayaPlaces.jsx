@@ -54,7 +54,7 @@ export default function MazayaPlaces() {
     center = null,         // {lat, lng} optional initial center
     language = "en",
     region = "SA",         // helps bias to Saudi
-    max = 10,              // max places to resolve
+    max = 20,              // max places to resolve
     listFirst = true       // default to List view like your screenshot
   } = (typeof props === "object" && props) || {};
 
