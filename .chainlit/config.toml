@@ -70,9 +70,9 @@ name = "Mazaya Benefits Agent"
 
 default_theme = "light"
 
-# layout = "wide"
+layout = "wide"
 
-# default_sidebar_state = "open"
+default_sidebar_state = "open"
 
 # Description of the assistant. This is used for HTML tags.
 # description = ""
