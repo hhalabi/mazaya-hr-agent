@@ -1,60 +1,78 @@
 #!/usr/bin/env python3
 """
-Mazaya Benefits Agent (LangGraph + LangMem + PostgresStore) with STREAMING
+Mazaya Benefits Agent (LangGraph + LangMem + Postgres) — ASYNC, STREAMING
 
-- Supports the official Mazaya Excel (Active.xlsx) and the older internal sheet
-- Long-term memory persisted in Postgres (optionally with pgvector)
-- Short-term per-thread memory via SQLite checkpointer
-- Token streaming via LangGraph `stream_events` (prints tokens as they arrive)
+CHANGES IN THIS REV:
+- Fixed Postgres pool lifecycle: explicit open()/close() (no implicit open in ctor).
+- One-time importer now uses a direct async connection (no pool), and uses positional
+  placeholders (no named placeholders with spaces).
+- Added Windows event loop policy for CLI stability.
+- Same cleaned design as before: no XLSX at runtime; only official schema via Postgres.
 
-Run (env):
-  export OPENAI_API_KEY="YOUR_OPENAI_KEY_HERE"
-  export PG_CONN="postgresql://postgres:postgres@localhost:5432/mazaya_mem"
+ENV:
+  OPENAI_API_KEY
+  PG_CONN  (e.g. postgresql://user:pass@host:5432/mazaya_mem)
 
-Run (script):
-  python mazaya_agent_pg_streaming.py --csv_or_xlsx ./Active.xlsx --user-id hamza --thread-id t1 --stream
+USAGE:
+  # One-time import
+  python mazaya_agent_pg_streaming.py --import_xlsx ./Active.xlsx
+
+  # Interactive CLI (streaming)
+  python mazaya_agent_pg_streaming.py --user-id hamza --thread-id t1 --stream
 """
 
 import os
+import re
+import sys
 import json
 import argparse
-import re
+import asyncio
 from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
 from pydantic import BaseModel, Field
 
-# ---- I/O
-import pandas as pd
-
-# ---- LLM (OpenAI)
+# LLM
 from langchain_openai import ChatOpenAI
 
-# ---- LangGraph core
+# LangGraph
 from langgraph.prebuilt import create_react_agent
 from langgraph.config import get_config, get_store
-from langgraph.store.postgres import PostgresStore
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.store.postgres.aio import AsyncPostgresStore
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from dotenv import load_dotenv
-load_dotenv()
-
-# Prefer SQLite checkpointer for persistence if available
-try:
-    from langgraph.checkpoint.sqlite import SqliteSaver  # pip install langgraph-checkpoint-sqlite
-    _HAS_SQLITE = True
-except Exception:
-    _HAS_SQLITE = False
-
-# ---- Tools & memory helpers
-from langchain_core.tools import tool
+# LangMem tools
 from langmem import create_manage_memory_tool, create_search_memory_tool
 
+# Tools decorator
+from langchain_core.tools import tool
+from langchain_core.messages import AIMessageChunk, ToolMessage
 
-# =========================
-# Helpers
-# =========================
+# Psycopg (async)
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 
+# ---------- Windows event loop fix ----------
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+
+# ---------- Constants ----------
+OFFICIAL_XLSX_COLUMNS = [
+    "OfferID", "Company Name", "Offer Name En", "Offer Name Ar",
+    "Offer Details En", "Offer Details Ar", "Effective", "Discontinue",
+    "Unlimited", "Country", "Cities", "Category En", "Category Ar", "Status"
+]
+
+TABLE_NAME = "mazaya_offers_official"
+
+
+# ---------- Utils ----------
 def _norm(s: Any) -> str:
-    return (str(s).strip() if s is not None else "").replace("\n", " ").replace("  ", " ")
+    return (str(s).strip() if s is not None else "")
 
 def _lower(s: Any) -> str:
     return _norm(s).lower()
@@ -64,258 +82,271 @@ def _split_tokens(txt: str) -> List[str]:
         return []
     return [t.strip() for t in re.split(r"[;,/|،]+", txt) if t.strip()]
 
-def _join_locs(country: str, cities: str) -> str:
-    country = _norm(country)
-    cities = _norm(cities)
-    if cities:
-        return cities.lower()
-    return country.lower()
 
-# Back-compat location parser (kept for older sheet)
-def _extract_city_from_location(loc: str) -> str:
-    loc = _norm(loc)
-    m = re.search(r"\(([^)]+)\)", loc)
-    if m:
-        return _lower(m.group(1))
-    alias = _lower(loc)
-    alias = alias.replace("saudi arabia", "ksa").replace("kingdom-wide", "ksa-wide").strip()
-    return alias
+# ---------- Canonical projection ----------
+def row_to_canonical(r: Dict[str, Any]) -> Dict[str, Any]:
+    offer_id  = _norm(r.get("offer_id"))
+    provider  = _norm(r.get("company_name"))
+    name_en   = _norm(r.get("offer_name_en"))
+    name_ar   = _norm(r.get("offer_name_ar"))
+    det_en    = _norm(r.get("offer_details_en"))
+    det_ar    = _norm(r.get("offer_details_ar"))
+    eff       = _norm(r.get("effective"))
+    disc      = _norm(r.get("discontinue"))
+    unlimited = _norm(r.get("unlimited"))
+    country   = _norm(r.get("country"))
+    cities    = _norm(r.get("cities"))
+    cat_en    = _norm(r.get("category_en"))
+    cat_ar    = _norm(r.get("category_ar"))
+
+    rec_id = f"MZO-{offer_id or r.get('pk', '')}".strip("-")
+
+    title = name_en or name_ar or provider or "(no title)"
+    description = det_en if det_en else det_ar
+
+    dur = []
+    if eff: dur.append(f"effective: {eff}")
+    if disc: dur.append(f"discontinue: {disc}")
+    if unlimited and unlimited.lower() in ("yes", "true", "unlimited", "y", "1"):
+        dur.append("unlimited")
+    duration = " | ".join(dur)
+
+    location = (cities or country).lower()
+
+    tags_set = set()
+    for t in _split_tokens(cat_en) + _split_tokens(cat_ar):
+        tags_set.add(t.lower())
+    for city in _split_tokens(cities):
+        tags_set.add(city.lower())
+    name_hint = (name_en or name_ar).lower() if (name_en or name_ar) else ""
+    if "women" in name_hint or "نسائي" in name_hint: tags_set.add("women")
+    if "family" in name_hint or "عائلة" in name_hint or "أُسرة" in name_hint: tags_set.add("family")
+
+    return {
+        "id": rec_id,
+        "title": title,
+        "category": (cat_en or cat_ar).lower(),
+        "provider": provider,
+        "description": description or "",
+        "location": location,
+        "duration": duration,
+        "contact": "",
+        "website": "",
+        "url": "",
+        "tags": ", ".join(sorted(tags_set)),
+        "_cities_raw": cities,
+        "_country_raw": country,
+    }
 
 
-# =========================
-# Domain: Mazaya Benefits
-# =========================
-
-CANONICAL_FIELDS = [
-    "id", "title", "category", "provider", "description",
-    "location", "duration", "contact", "website", "url", "tags"
-]
-
-# Old sheet columns (kept for compatibility)
-OLD_XLSX_COLUMNS = [
-    "Category", "CardName", "Title", "Offer", "Location", "Duration", "Contact", "Website", "Offer_URL"
-]
-
-# Official Mazaya columns (new dataset)
-OFFICIAL_XLSX_COLUMNS = [
-    "OfferID", "Company Name", "Offer Name En", "Offer Name Ar",
-    "Offer Details En", "Offer Details Ar", "Effective", "Discontinue",
-    "Unlimited", "Country", "Cities", "Category En", "Category Ar", "Status"
-]
-
-class BenefitsIndex:
+# ---------- Benefits Repository ----------
+class BenefitsRepo:
     """
-    In-memory index over Excel/CSV.
-    - Auto-detects *official* Mazaya schema vs the older internal table.
-    - Normalizes to canonical fields.
-    - Search across English + Arabic (name/details/category) & provider, tags, location, duration.
+    Async repository using a Postgres connection pool.
+
+    Table:
+      CREATE TABLE IF NOT EXISTS mazaya_offers_official (
+        offer_id TEXT PRIMARY KEY,
+        company_name TEXT,
+        offer_name_en TEXT, offer_name_ar TEXT,
+        offer_details_en TEXT, offer_details_ar TEXT,
+        effective TEXT, discontinue TEXT,
+        unlimited TEXT,
+        country TEXT, cities TEXT,
+        category_en TEXT, category_ar TEXT,
+        status TEXT
+      );
     """
-    def __init__(self, rows: List[Dict[str, str]]):
-        self.rows = rows
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self.pool: Optional[AsyncConnectionPool] = None
 
-    @staticmethod
-    def _load_frame(path: str) -> pd.DataFrame:
-        ext = path.lower().split(".")[-1]
-        if ext in ("xlsx", "xls"):
-            return pd.read_excel(path, sheet_name=0, engine="openpyxl")
-        elif ext == "csv":
-            return pd.read_csv(path, encoding="utf-8")
-        else:
-            raise ValueError("Unsupported file type. Please provide .xlsx/.xls or .csv")
-
-    @staticmethod
-    def from_file(path: str) -> "BenefitsIndex":
-        df = BenefitsIndex._load_frame(path)
-
-        cols = set(df.columns)
-        if set(OFFICIAL_XLSX_COLUMNS).issubset(cols):
-            rows = BenefitsIndex._normalize_official(df)
-        elif set(OLD_XLSX_COLUMNS).issubset(cols):
-            rows = BenefitsIndex._normalize_old(df)
-        else:
-            raise ValueError(
-                "Input schema not recognized. Expected official Mazaya columns or the older internal columns."
+    async def open(self):
+        if self.pool is None:
+            # Do NOT open in constructor. Open explicitly here.
+            self.pool = AsyncConnectionPool(
+                conninfo=self.dsn,
+                min_size=1,
+                max_size=8,
+                open=False,
+                kwargs={"autocommit": True, "row_factory": dict_row},
             )
-        return BenefitsIndex(rows)
+        if self.pool.closed:  # psycopg ≥3.2 exposes .closed
+            await self.pool.open()
+        else:
+            await self.pool.open()
 
-    @staticmethod
-    def _normalize_official(df: pd.DataFrame) -> List[Dict[str, str]]:
-        # Filter to Active if provided
-        if "Status" in df.columns:
+    async def close(self):
+        if self.pool is not None:
             try:
-                df = df[df["Status"].astype(str).str.lower().eq("active") | df["Status"].isna()]
+                await self.pool.close()
             except Exception:
                 pass
 
-        rows: List[Dict[str, str]] = []
-        for i, r in df.iterrows():
-            offer_id = _norm(r.get("OfferID"))
-            provider = _norm(r.get("Company Name"))
-            name_en  = _norm(r.get("Offer Name En"))
-            name_ar  = _norm(r.get("Offer Name Ar"))
-            det_en   = _norm(r.get("Offer Details En"))
-            det_ar   = _norm(r.get("Offer Details Ar"))
-            eff      = _norm(r.get("Effective"))
-            disc     = _norm(r.get("Discontinue"))
-            unlimited= _norm(r.get("Unlimited"))
-            country  = _norm(r.get("Country"))
-            cities   = _norm(r.get("Cities"))
-            cat_en   = _norm(r.get("Category En"))
-            cat_ar   = _norm(r.get("Category Ar"))
-
-            # ID
-            if offer_id:
-                rec_id = f"MZO-{offer_id}"
-            else:
-                slug_bits = f"{provider}-{name_en or name_ar or 'offer'}"
-                slug = re.sub(r"[^a-zA-Z0-9]+", "-", slug_bits).strip("-").lower()[:40]
-                rec_id = f"MZO-{i+1:04d}-{slug}"
-
-            # Title/Description
-            title = name_en or name_ar or provider or "(no title)"
-            description = det_en
-            if det_ar:
-                description = f"{description} | {det_ar}" if description else det_ar
-
-            # Duration string
-            dur_bits = []
-            if eff: dur_bits.append(f"effective: {eff}")
-            if disc: dur_bits.append(f"discontinue: {disc}")
-            if unlimited and unlimited.lower() in ("yes", "true", "unlimited", "y", "1"):
-                dur_bits.append("unlimited")
-            duration = " | ".join(dur_bits)
-
-            # Location
-            location = _join_locs(country, cities)
-
-            # Tags
-            tags_set = set()
-            for t in _split_tokens(cat_en) + _split_tokens(cat_ar):
-                tags_set.add(t.lower())
-            for city in _split_tokens(cities):
-                tags_set.add(city.lower())
-            name_hint = (name_en or name_ar).lower() if (name_en or name_ar) else ""
-            if "women" in name_hint or "نسائي" in name_hint:
-                tags_set.add("women")
-            if "family" in name_hint or "عائلة" in name_hint or "أُسرة" in name_hint:
-                tags_set.add("family")
-
-            canonical = {
-                "id": rec_id,
-                "title": title,
-                "category": (cat_en or cat_ar).lower(),
-                "provider": provider,
-                "description": description,
-                "location": location,
-                "duration": duration,
-                "contact": "",
-                "website": "",
-                "url": "",
-                "tags": ", ".join(sorted(tags_set)),
-                # hidden fields for search breadth
-                "_name_ar": name_ar,
-                "_details_ar": det_ar,
-                "_cat_ar": cat_ar,
-                "_cities_raw": cities,
-                "_country_raw": country,
-            }
-            rows.append(canonical)
-        return rows
-
-    @staticmethod
-    def _normalize_old(df: pd.DataFrame) -> List[Dict[str, str]]:
-        rows: List[Dict[str, str]] = []
-        for i, r in df.iterrows():
-            category  = _norm(r.get("Category"))
-            provider  = _norm(r.get("CardName"))
-            title     = _norm(r.get("Title"))
-            offer     = _norm(r.get("Offer"))
-            location  = _norm(r.get("Location"))
-            duration  = _norm(r.get("Duration"))
-            contact   = _norm(r.get("Contact"))
-            website   = _norm(r.get("Website"))
-            url       = _norm(r.get("Offer_URL"))
-
-            slug_bits = f"{provider}-{title}" if provider or title else f"row-{i+1}"
-            slug = re.sub(r"[^a-zA-Z0-9]+", "-", slug_bits).strip("-").lower()[:40]
-            rec_id = f"MZ{(i+1):04d}-{slug}" if slug else f"MZ{(i+1):04d}"
-
-            tags = []
-            if category:
-                parts = [p.strip() for p in re.split(r"[/,|]+", category) if p.strip()]
-                tags.extend([p.lower() for p in parts])
-            city = _extract_city_from_location(location)
-            if city and city not in tags:
-                tags.append(city)
-
-            canonical = {
-                "id": rec_id,
-                "title": title or provider or "(no title)",
-                "category": category.lower(),
-                "provider": provider,
-                "description": offer,
-                "location": location.lower(),
-                "duration": duration,
-                "contact": contact,
-                "website": website,
-                "url": url,
-                "tags": ", ".join(sorted(set(tags))),
-            }
-            rows.append(canonical)
-        return rows
-
-    def _match_score(self, text: str, hay: str) -> int:
-        score = 0
-        for token in [t.strip() for t in text.split() if t.strip()]:
-            if token in hay:
-                score += 1
-        return score
-
-    def search(self, query: str = "", filters: Optional[Dict[str, Any]] = None, limit: int = 12) -> List[Dict[str, Any]]:
+    async def import_official_xlsx(self, path: str):
         """
-        Keyword search + simple filters
-          filters: {category, location, tag, provider_contains, city}
+        One-time importer: direct async connection (no pool).
+        Uses positional placeholders to avoid issues with column names containing spaces.
         """
-        q = _lower(query or "")
+        df = pd.read_excel(path, sheet_name=0, engine="openpyxl")
+        cols = {c.strip() for c in df.columns}
+        if not set(OFFICIAL_XLSX_COLUMNS).issubset(cols):
+            raise ValueError("Input schema not recognized. Expected official Mazaya columns.")
+
+        # Normalize dataframe column access to exact names
+        async with await psycopg.AsyncConnection.connect(self.dsn) as con:
+            async with con.cursor() as cur:
+                await cur.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+                        offer_id TEXT PRIMARY KEY,
+                        company_name TEXT,
+                        offer_name_en TEXT, offer_name_ar TEXT,
+                        offer_details_en TEXT, offer_details_ar TEXT,
+                        effective TEXT, discontinue TEXT,
+                        unlimited TEXT,
+                        country TEXT, cities TEXT,
+                        category_en TEXT, category_ar TEXT,
+                        status TEXT
+                    );
+                """)
+                # Upsert each row
+                for _, r in df.iterrows():
+                    offer_id = r.get("OfferID")
+                    if offer_id is None or (isinstance(offer_id, float) and pd.isna(offer_id)):
+                        # Skip rows without a stable OfferID
+                        continue
+                    values = (
+                        r.get("OfferID"),
+                        r.get("Company Name"),
+                        r.get("Offer Name En"),
+                        r.get("Offer Name Ar"),
+                        r.get("Offer Details En"),
+                        r.get("Offer Details Ar"),
+                        r.get("Effective"),
+                        r.get("Discontinue"),
+                        r.get("Unlimited"),
+                        r.get("Country"),
+                        r.get("Cities"),
+                        r.get("Category En"),
+                        r.get("Category Ar"),
+                        r.get("Status"),
+                    )
+                    await cur.execute(
+                        f"""
+                        INSERT INTO {TABLE_NAME} (
+                          offer_id, company_name, offer_name_en, offer_name_ar,
+                          offer_details_en, offer_details_ar, effective, discontinue,
+                          unlimited, country, cities, category_en, category_ar, status
+                        )
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (offer_id) DO UPDATE SET
+                          company_name=EXCLUDED.company_name,
+                          offer_name_en=EXCLUDED.offer_name_en,
+                          offer_name_ar=EXCLUDED.offer_name_ar,
+                          offer_details_en=EXCLUDED.offer_details_en,
+                          offer_details_ar=EXCLUDED.offer_details_ar,
+                          effective=EXCLUDED.effective,
+                          discontinue=EXCLUDED.discontinue,
+                          unlimited=EXCLUDED.unlimited,
+                          country=EXCLUDED.country,
+                          cities=EXCLUDED.cities,
+                          category_en=EXCLUDED.category_en,
+                          category_ar=EXCLUDED.category_ar,
+                          status=EXCLUDED.status;
+                        """,
+                        values,
+                    )
+            await con.commit()
+
+    async def _ensure_open(self):
+        if self.pool is None or self.pool.closed:
+            await self.open()
+
+    async def _fetch_rows(self, where_sql: str = "", args: Tuple[Any, ...] = (), limit: int = 50) -> List[Dict[str, Any]]:
+        await self._ensure_open()
+        sql = f"""
+            SELECT
+                offer_id, company_name, offer_name_en, offer_name_ar,
+                offer_details_en, offer_details_ar, effective, discontinue,
+                unlimited, country, cities, category_en, category_ar, status
+            FROM {TABLE_NAME}
+            WHERE (status IS NULL OR lower(status) = 'active')
+            {('AND ' + where_sql) if where_sql else ''}
+            LIMIT {int(limit)};
+        """
+        async with self.pool.connection() as con:
+            async with con.cursor() as cur:
+                await cur.execute(sql, args)
+                rows = await cur.fetchall()
+        return [row_to_canonical(r) for r in rows]
+
+    async def search(self, query: str = "", filters: Optional[Dict[str, Any]] = None, limit: int = 12) -> List[Dict[str, Any]]:
         filters = filters or {}
-        f_cat = _lower(filters.get("category", ""))
-        f_loc = _lower(filters.get("location", ""))
-        f_tag = _lower(filters.get("tag", ""))
+        args: List[Any] = []
+        parts: List[str] = []
+
+        if query:
+            like = f"%{query}%"
+            parts.append("""
+                (
+                    offer_name_en ILIKE %s OR offer_name_ar ILIKE %s OR
+                    offer_details_en ILIKE %s OR offer_details_ar ILIKE %s OR
+                    company_name ILIKE %s OR category_en ILIKE %s OR category_ar ILIKE %s OR
+                    cities ILIKE %s OR country ILIKE %s
+                )
+            """)
+            args.extend([like, like, like, like, like, like, like, like, like])
+
+        f_cat  = _lower(filters.get("category", ""))
+        f_loc  = _lower(filters.get("location", ""))
+        f_tag  = _lower(filters.get("tag", ""))
         f_prov = _lower(filters.get("provider_contains", ""))
         f_city = _lower(filters.get("city", ""))
 
-        scored: List[Tuple[int, Dict[str, Any]]] = []
-        for r in self.rows:
+        if f_cat:
+            parts.append("(lower(category_en) = %s OR lower(category_ar) = %s)")
+            args.extend([f_cat, f_cat])
+        if f_loc:
+            parts.append("(lower(country) = %s OR lower(cities) ILIKE %s)")
+            args.extend([f_loc, f"%{f_loc}%"])
+        if f_city:
+            parts.append("lower(cities) ILIKE %s")
+            args.append(f"%{f_city}%")
+        if f_prov:
+            parts.append("lower(company_name) ILIKE %s")
+            args.append(f"%{f_prov}%")
+        if f_tag:
+            parts.append("(lower(category_en) ILIKE %s OR lower(category_ar) ILIKE %s OR lower(cities) ILIKE %s)")
+            args.extend([f"%{f_tag}%", f"%{f_tag}%", f"%{f_tag}%"])
+
+        base = await self._fetch_rows(" AND ".join([p.strip() for p in parts if p.strip()]), tuple(args), limit=100)
+
+        q = _lower(query)
+        def score(rec: Dict[str, Any]) -> int:
+            s = 0
             hay = " ".join([
-                r.get("title",""), r.get("description",""), r.get("category",""),
-                r.get("provider",""), r.get("tags",""), r.get("location",""),
-                r.get("duration",""), r.get("_name_ar",""), r.get("_details_ar",""), r.get("_cat_ar","")
+                rec.get("title", ""), rec.get("description", ""), rec.get("category", ""),
+                rec.get("provider", ""), rec.get("tags", ""), rec.get("location", "")
             ]).lower()
-
-            # hard filters
-            if f_cat and f_cat not in r.get("category",""): continue
-            if f_loc and f_loc not in r.get("location",""): continue
-            if f_tag and f_tag not in r.get("tags",""): continue
-            if f_city and f_city not in r.get("_cities_raw","").lower(): continue
-            if f_prov and f_prov not in r.get("provider","").lower(): continue
-
-            score = 0
             if q:
-                score += self._match_score(q, hay)
-            scored.append((score, r))
+                for tok in [t for t in q.split() if t]:
+                    if tok in hay:
+                        s += 1
+            if f_city and f_city in (rec.get("_cities_raw", "") or "").lower(): s += 1
+            if f_cat and f_cat == rec.get("category", ""): s += 2
+            if f_prov and f_prov in (rec.get("provider", "") or "").lower(): s += 1
+            if f_tag and f_tag in rec.get("tags", ""): s += 2
+            return s
 
-        scored.sort(key=lambda x: (-x[0], x[1].get("title","")))
-        return [s[1] for s in scored[:limit]]
+        base.sort(key=lambda r: (-score(r), r.get("title", "")))
+        return base[:limit]
 
-    def recommend(self, preferences: Dict[str, Any], limit: int = 8) -> List[Dict[str, Any]]:
-        """
-        Scoring:
-          +3 tag match
-          +2 category match
-          +1 location/city match
-          -2 disliked keyword found
-          + keywords matched in title/description (EN/AR)
-        """
+    async def recommend(self, preferences: Dict[str, Any], limit: int = 8) -> List[Dict[str, Any]]:
+        filters: Dict[str, Any] = {}
+        if preferences.get("city"):     filters["city"] = preferences["city"]
+        if preferences.get("location"): filters["location"] = preferences["location"]
+        candidates = await self.search(query="", filters=filters, limit=max(60, limit * 6))
+
         pref_tags = [_lower(t) for t in preferences.get("tags", [])]
         pref_cats = [_lower(c) for c in preferences.get("categories", [])]
         pref_loc  = _lower(preferences.get("location", ""))
@@ -323,91 +354,90 @@ class BenefitsIndex:
         disliked  = [_lower(d) for d in preferences.get("disliked", [])]
         keywords  = [_lower(k) for k in preferences.get("keywords", [])]
 
-        scored = []
-        for r in self.rows:
-            score = 0
-            tags = r.get("tags","")
-            hay = " ".join([
-                r.get("title",""),
-                r.get("description",""),
-                r.get("_details_ar","")
-            ]).lower()
-
-            if pref_tags and any(t in tags for t in pref_tags): score += 3
-            if pref_cats and r.get("category","") in pref_cats: score += 2
-            if pref_loc and pref_loc in r.get("location",""): score += 1
-            if pref_city and pref_city in r.get("_cities_raw","").lower(): score += 1
-            if disliked and any(d in hay for d in disliked): score -= 2
+        def score(rec: Dict[str, Any]) -> int:
+            s = 0
+            tags = rec.get("tags", "")
+            hay = " ".join([rec.get("title",""), rec.get("description","")]).lower()
+            if pref_tags and any(t in tags for t in pref_tags): s += 3
+            if pref_cats and rec.get("category","") in pref_cats: s += 2
+            if pref_loc and pref_loc in rec.get("location",""): s += 1
+            if pref_city and pref_city in (rec.get("_cities_raw","") or "").lower(): s += 1
+            if disliked and any(d in hay for d in disliked): s -= 2
             for k in keywords:
-                if k in hay:
-                    score += 1
+                if k in hay: s += 1
+            return s
 
-            scored.append((score, r))
-        scored.sort(key=lambda x: (-x[0], x[1].get("title","")))
-        return [s[1] for s in scored[:limit]]
+        candidates.sort(key=lambda r: (-score(r), r.get("title","")))
+        return candidates[:limit]
 
 
-# =========================
-# Long-term memory schema
-# =========================
-
+# ---------- Long-term memory schema ----------
 class UserTraits(BaseModel):
-    """Structured profile persisted long-term."""
+    """Structured profile persisted long-term (via LangMem)."""
     name: Optional[str] = None
-    role: Optional[str] = None               # "cabin crew", "ground ops", etc.
+    role: Optional[str] = None
     department: Optional[str] = None
-    location: Optional[str] = None           # city/country
-    family_status: Optional[str] = None      # "single", "married", "kids"
+    location: Optional[str] = None
+    family_status: Optional[str] = None
     languages: List[str] = Field(default_factory=list)
-    personality_traits: List[str] = Field(default_factory=list)  # "outdoorsy", "budget-conscious"
-    preferences: Dict[str, Any] = Field(default_factory=dict)    # tags/categories/keywords/disliked/city
+    personality_traits: List[str] = Field(default_factory=list)
+    preferences: Dict[str, Any] = Field(default_factory=dict)
     recent_positive: List[str] = Field(default_factory=list)
     recent_negative: List[str] = Field(default_factory=list)
 
 
-# ================
-# Tools
-# ================
+# ---------- Tools (async, explicit docstrings) ----------
+_REPO: Optional[BenefitsRepo] = None
 
-_BENEFITS_INDEX: Optional[BenefitsIndex] = None
+@tool("search_and_recommend_benefits", return_direct=False)
+async def search_and_recommend_benefits(query: str = "", filters_json: str = "", limit: int = 12) -> str:
+    """
+    Search Mazaya benefits (official catalog in Postgres).
 
-@tool("search_benefits", return_direct=False)
-def search_benefits(query: str = "", filters_json: str = "", limit: int = 12) -> str:
+    Use this when the user specifies cities/categories/providers or free-text.
+    Filters JSON supports: {"category","location","tag","provider_contains","city"}.
+    Prefer `recommend_benefits` for generic "suggest something" requests.
+
+    Returns: JSON -> {"results":[...], "used_filters":{...}, "query":"..."}
     """
-    Search benefits from XLSX/CSV-backed index.
-    Filters (JSON): {category, location, tag, provider_contains, city}
-    """
-    if _BENEFITS_INDEX is None:
-        return json.dumps({"error": "Benefits index not initialized"})
+    if _REPO is None:
+        return json.dumps({"error": "Benefits repository not initialized"})
     try:
         filters = json.loads(filters_json) if filters_json else {}
     except Exception:
         filters = {}
-    rows = _BENEFITS_INDEX.search(query=query, filters=filters, limit=limit)
-    return json.dumps({"results": rows}, ensure_ascii=False, indent=2)
+    rows = await _REPO.search(query=query or "", filters=filters, limit=limit)
+    return json.dumps({"results": rows, "used_filters": filters, "query": query or ""}, ensure_ascii=False, indent=2)
 
 @tool("recommend_benefits", return_direct=False)
-def recommend_benefits(preferences_json: str = "", limit: int = 8) -> str:
+async def recommend_benefits(preferences_json: str = "", limit: int = 8) -> str:
     """
-    Recommend benefits based on preferences JSON:
-      { tags:[], categories:[], location:"", city:"", disliked:[], keywords:[] }
+    Recommend Mazaya benefits using the user's long-term preferences.
+
+    AGENT BEHAVIOR:
+    - For generic requests ("show me some benefits"), first call the LangMem search
+      tool to fetch ("memories","{langgraph_user_id}","profile"), extract `.preferences`,
+      then pass them here.
+
+    Args: preferences_json like {"tags":[],"categories":[],"keywords":[],"disliked":[],"city":"","location":""}
+    Returns: JSON -> {"results":[...], "used_prefs":{...}}
     """
-    if _BENEFITS_INDEX is None:
-        return json.dumps({"error": "Benefits index not initialized"})
+    if _REPO is None:
+        return json.dumps({"error": "Benefits repository not initialized"})
+    prefs: Dict[str, Any] = {}
     try:
         prefs = json.loads(preferences_json) if preferences_json else {}
     except Exception:
         prefs = {}
-    rows = _BENEFITS_INDEX.recommend(prefs, limit=limit)
+    rows = await _REPO.recommend(prefs, limit=limit)
     return json.dumps({"results": rows, "used_prefs": prefs}, ensure_ascii=False, indent=2)
 
-# Optional deterministic memory save tool (handy in demos/tests)
 @tool("remember_traits", return_direct=False)
-def remember_traits(json_payload: str) -> str:
+async def remember_traits(json_payload: str) -> str:
     """
-    Force-save stable traits/preferences. json_payload should match UserTraits fields (partial ok).
-    Example:
-      {"location":"jeddah","preferences":{"tags":["yoga","family"],"city":"jeddah"}}
+    Persist stable traits/preferences under ("memories",{langgraph_user_id},"profile").
+    Payload should match (partial) UserTraits. Example:
+      {"location":"jeddah","preferences":{"tags":["family","fitness"],"city":"jeddah"}}
     """
     cfg = get_config()
     store = get_store()
@@ -416,26 +446,21 @@ def remember_traits(json_payload: str) -> str:
     except Exception as e:
         return f"Invalid JSON: {e}"
     ns = ("memories", cfg["configurable"]["langgraph_user_id"], "profile")
-    current = store.get(ns, "profile")
+    current = await store.aget(ns, "profile")
     merged = {}
     if current and isinstance(current.value, dict) and "content" in current.value:
         merged = current.value["content"]
     elif current and isinstance(current.value, dict):
         merged = current.value
     merged.update(data)
-    store.put(ns, "profile", {"content": merged}, index={"text": json.dumps(merged, ensure_ascii=False)})
+    await store.aput(ns, "profile", {"content": merged}, index={"text": json.dumps(merged, ensure_ascii=False)})
     return "Saved."
 
 
-# =========================
-# Prompt (inject memories)
-# =========================
-
+# ---------- Prompt ----------
 def system_prompt_with_memories(state: Dict[str, Any]):
     cfg = get_config()
     store = get_store()
-
-    # Load stored profile for this user-id
     memories_text = ""
     try:
         ns = ("memories", cfg["configurable"]["langgraph_user_id"], "profile")
@@ -447,37 +472,28 @@ def system_prompt_with_memories(state: Dict[str, Any]):
         memories_text = ""
 
     rules = f"""
-    You are the "Mazaya Benefits Agent" for Saudia Airlines' employee benefits program (Mazaya).
-    Your job:
-    1) Always start by searching for existing memories about the user via the memory tool(s). If memory exists, welcome back the user and reference relevant memories. If not, then gather context.
-    2) Answer questions strictly from the structured benefits table via tools.
-    3) Recommend the best benefits, explaining *why* briefly (match to user preferences).
-    4) Maintain *long-term memory* of stable user traits/preferences using the memory tool(s).
+You are the **Mazaya Benefits Agent** for Saudia Airlines' employee benefits (Mazaya).
 
-    When searching for benefits, keep in mind that those are the available categories: ["Automotive Sales", "Car Rentals", "Education", "Electronics", "Entertainment", "Fashion & Apparel", "Financial Offers", "Fitness", "Furniture", "General Services", "Hotels", "Maintenance", "Medical & Health", "Real Estate", "Restaurants", "Women's Care"].
-    When recommending, prefer benefits that match the user's preferences, especially if they ask for suggestions in general.
+Instructions:
+1) Always start by loading the user's profile via the create_search_memory_tool. If no profile exists, ask up short questions to gather preferences. If a profile exists, welcome the user back and use their preferences and remind them what you know about them.
+2) For explicit queries, call `search_and_recommend_benefits` with appropriate filters.
+3) Be concise and explain *why* each recommendation matches preferences.
+4) Create or update the user's profile via the create_manage_memory_tool, especially after learning new stable traits/preferences.
 
-    When you learn a new stable preference/trait, proactively call the memory tool to CREATE/UPDATE the user's profile.
-    If unsure, ask concise follow-ups. Keep answers clear and scoped to Mazaya.
+When using search_and_recommend_benefits, keep in mind that those are the available categories: ["Automotive Sales", "Car Rentals", "Education", "Electronics", "Entertainment", "Fashion & Apparel", "Financial Offers", "Fitness", "Furniture", "General Services", "Hotels", "Maintenance", "Medical & Health", "Real Estate", "Restaurants", "Women's Care"].
 
-    <LONG_TERM_MEMORY_JSON>
-    {memories_text}
-    </LONG_TERM_MEMORY_JSON>
-    """.strip()
+<LONG_TERM_MEMORY_JSON>
+{memories_text}
+</LONG_TERM_MEMORY_JSON>
+""".strip()
 
     return [{"role": "system", "content": rules}, *state["messages"]]
 
 
-# =========================
-# Build the agent
-# =========================
-
-def build_agent(file_path: str, checkpointer, store: PostgresStore, preloaded_rows: List[Dict[str, Any]] | None = None):
-    global _BENEFITS_INDEX
-    if preloaded_rows is None:
-        _BENEFITS_INDEX = BenefitsIndex.from_file(file_path)
-    else:
-        _BENEFITS_INDEX = BenefitsIndex(preloaded_rows)
+# ---------- Build agent ----------
+async def build_agent(pg_conn: str, repo: BenefitsRepo, checkpointer: AsyncPostgresSaver, store: AsyncPostgresStore):
+    global _REPO
+    _REPO = repo
 
     manage_memory_tool = create_manage_memory_tool(
         namespace=("memories", "{langgraph_user_id}", "profile"),
@@ -491,7 +507,7 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore, preloaded_ro
 
     agent = create_react_agent(
         llm,
-        tools=[search_benefits, recommend_benefits, manage_memory_tool, search_memory_tool, remember_traits],
+        tools=[search_and_recommend_benefits, manage_memory_tool, search_memory_tool],
         prompt=system_prompt_with_memories,
         store=store,
         checkpointer=checkpointer,
@@ -499,111 +515,72 @@ def build_agent(file_path: str, checkpointer, store: PostgresStore, preloaded_ro
     return agent
 
 
-# =========================
-# CLI (with streaming)
-# =========================
+# ---------- CLI ----------
+async def run_cli(pg_conn: str, user_id: str, thread_id: str, stream: bool):
+    repo = BenefitsRepo(pg_conn)
+    await repo.open()
 
+    store_cm = AsyncPostgresStore.from_conn_string(pg_conn, index={"dims": 1536, "embed": "openai:text-embedding-3-small"})
+    ckpt_cm = AsyncPostgresSaver.from_conn_string(pg_conn)
 
-def run_cli_loop_streaming(agent, args):
-    print("\nMazaya Benefits Agent (streaming). Type your question (Ctrl+C to exit).\n")
-    while True:
-        try:
-            user = input("You: ").strip()
+    store = await store_cm.__aenter__()
+    checkpointer = await ckpt_cm.__aenter__()
+
+    agent = await build_agent(pg_conn, repo, checkpointer, store)
+
+    print("\nMazaya Benefits Agent (async streaming). Ctrl+C to exit.\n")
+    try:
+        while True:
+            try:
+                user = await asyncio.to_thread(input, "You: ")
+            except KeyboardInterrupt:
+                break
+            user = (user or "").strip()
             if not user:
                 continue
 
-            config = {
-                "configurable": {
-                    "langgraph_user_id": args.user_id,  # long-term namespace key
-                    "thread_id": args.thread_id,        # short-term (checkpoint) key
-                }
-            }
-
+            config = {"configurable": {"langgraph_user_id": user_id, "thread_id": thread_id}}
             print("\nAgent: ", end="", flush=True)
 
-            # Stream ONLY LLM tokens (use "updates" if you want step-by-step progress instead)
-            for msg, meta in agent.stream(
+            async for msg_chunk, meta in agent.astream(
                 {"messages": [{"role": "user", "content": user}]},
                 config=config,
-                stream_mode="messages",  # token stream
+                stream_mode="messages",
             ):
-                # With prebuilt create_react_agent, the LLM node name is "agent"
-                # Filter so you don't print tool/other-node tokens if you later add more LLMs.
                 if meta.get("langgraph_node") != "agent":
                     continue
-
-                # msg is a MessageChunk; print incremental text as it arrives
-                if hasattr(msg, "content"):
-                    if isinstance(msg.content, str):
-                        print(msg.content, end="", flush=True)
-                    elif isinstance(msg.content, list):
-                        # content can be list of parts; concat text-like parts
-                        for part in msg.content:
-                            if isinstance(part, dict) and "text" in part:
-                                print(part["text"], end="", flush=True)
-
-            print("")  # newline after full answer
-
-        except KeyboardInterrupt:
-            print("\nBye!")
-            break
+                text = getattr(msg_chunk, "content", "")
+                if isinstance(text, str) and text:
+                    print(text, end="", flush=True)
+                elif isinstance(text, list):
+                    for part in text:
+                        if isinstance(part, dict) and "text" in part:
+                            print(part["text"], end="", flush=True)
+            print("")
+    finally:
+        await repo.close()
+        await ckpt_cm.__aexit__(None, None, None)
+        await store_cm.__aexit__(None, None, None)
 
 
-def run_cli_loop_blocking(agent, args):
-    print("\nMazaya Benefits Agent ready. Type your question (Ctrl+C to exit).\n")
-    while True:
-        try:
-            user = input("You: ").strip()
-            if not user:
-                continue
-            config = {
-                "configurable": {
-                    "langgraph_user_id": args.user_id,
-                    "thread_id": args.thread_id,
-                }
-            }
-            out = agent.invoke({"messages": [{"role": "user", "content": user}]}, config=config)
-            print(f"\nAgent: {out['messages'][-1].content}\n")
-        except KeyboardInterrupt:
-            print("\nBye!")
-            break
-
-
-def main():
+# ---------- Main ----------
+async def _amain():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv_or_xlsx", required=True, help="Path to Mazaya offers XLSX/CSV")
-    parser.add_argument("--user-id", required=True, help="Stable user ID for long-term memory namespace")
-    parser.add_argument("--thread-id", default="default", help="Conversation thread (short-term memory scope)")
-    parser.add_argument("--pg-conn", default=os.getenv("PG_CONN", "postgresql://postgres:postgres@localhost:5432/mazaya_mem"))
-    parser.add_argument("--stream", action="store_true", help="Enable token streaming to stdout")
+    parser.add_argument("--user-id", default="anon")
+    parser.add_argument("--thread-id", default="default")
+    parser.add_argument("--pg-conn", default=os.getenv("PG_CONN", "postgresql://postgres:%254~K%5D%3BUAJCjL%7D%3CA%3B@34.166.107.36:5432/mazayamem?sslmode=require"))
+    parser.add_argument("--stream", action="store_true")
+    parser.add_argument("--import_xlsx", help="Path to official Mazaya XLSX to import, then exit")
     args = parser.parse_args()
 
-    # ---- Persistent long-term memory store (Postgres) ----
-    with PostgresStore.from_conn_string(
-        args.pg_conn,
-        index={"dims": 1536, "embed": "openai:text-embedding-3-small"}  # set to None if pgvector not available
-        # index=None
-    ) as store:
-        try:
-            store.setup()
-        except Exception as e:
-            print(f"[WARN] store.setup() failed (vector index may be unavailable): {e}")
+    if args.import_xlsx:
+        repo = BenefitsRepo(args.pg_conn)
+        # direct connection used inside; no need to open pool here
+        await repo.import_official_xlsx(args.import_xlsx)
+        print(f"Imported '{args.import_xlsx}' into {TABLE_NAME}.")
+        return
 
-        # ---- Short-term memory (SQLite checkpointer) ----
-        if _HAS_SQLITE:
-            with SqliteSaver.from_conn_string("mazaya_checkpoints.db") as checkpointer:
-                agent = build_agent(args.csv_or_xlsx, checkpointer=checkpointer, store=store)
-                if args.stream:
-                    run_cli_loop_streaming(agent, args)
-                else:
-                    run_cli_loop_blocking(agent, args)
-        else:
-            checkpointer = MemorySaver()
-            agent = build_agent(args.csv_or_xlsx, checkpointer=checkpointer, store=store)
-            if args.stream:
-                run_cli_loop_streaming(agent, args)
-            else:
-                run_cli_loop_blocking(agent, args)
+    await run_cli(args.pg_conn, args.user_id, args.thread_id, args.stream)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(_amain())
