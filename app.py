@@ -10,6 +10,8 @@ import json
 import traceback
 import asyncio
 import chainlit as cl
+import vertexai
+
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -17,8 +19,16 @@ if sys.platform.startswith("win"):
 from langchain_core.messages import ToolMessage, AIMessageChunk
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from chainlit.data.sql_alchemy import SQLAlchemyDataLayer
 
 from mazaya_agent_pg_streaming import build_agent, BenefitsRepo
+
+
+vertexai.init(
+    project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+    location=os.getenv("GOOGLE_CLOUD_LOCATION"),
+)
+
 
 def _pretty_json_text(value, limit: int = 1200) -> str:
     if isinstance(value, (dict, list)):
@@ -32,49 +42,77 @@ def _pretty_json_text(value, limit: int = 1200) -> str:
             pass
     return (s[:limit] + "…") if len(s) > limit else s
 
+
 def _first_city(row: dict) -> str:
     cities = (row.get("_cities_raw") or "").strip()
     if cities:
         parts = [c.strip() for c in cities.replace("،", ",").split(",") if c.strip()]
-        if parts: return parts[0]
+        if parts:
+            return parts[0]
     loc = (row.get("location") or "").lower()
-    for c in ["riyadh", "jeddah", "dammam", "al khobar", "khobar", "makkah", "madinah", "mecca"]:
-        if c in loc: return c.title()
+    for c in [
+        "riyadh",
+        "jeddah",
+        "dammam",
+        "al khobar",
+        "khobar",
+        "makkah",
+        "madinah",
+        "mecca",
+    ]:
+        if c in loc:
+            return c.title()
     return ""
+
 
 def _build_places_queries(rows: list[dict]) -> list[dict]:
     out = []
     for r in rows:
-        out.append({
-            "id": r.get("id"),
-            "title": (r.get("title") or "").strip(),
-            "provider": (r.get("provider") or "").strip(),
-            "category": (r.get("category") or "").strip(),
-            "city": _first_city(r),
-            "country": "Saudi Arabia",
-            "url": (r.get("url") or "").strip()
-        })
+        out.append(
+            {
+                "id": r.get("id"),
+                "title": (r.get("title") or "").strip(),
+                "provider": (r.get("provider") or "").strip(),
+                "category": (r.get("category") or "").strip(),
+                "city": _first_city(r),
+                "country": "Saudi Arabia",
+                "url": (r.get("url") or "").strip(),
+            }
+        )
     return out[:10]
+
 
 @cl.on_chat_start
 async def on_chat_start():
     try:
-        pg_conn  = os.getenv("PG_CONN", "postgresql://postgres:%254~K%5D%3BUAJCjL%7D%3CA%3B@34.166.107.36:5432/mazayamem?sslmode=require")
+        pg_conn = os.getenv(
+            "PG_CONN",
+        )
         maps_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
-        map_id   = os.getenv("GOOGLE_MAP_ID", "map")
+        map_id = os.getenv("GOOGLE_MAP_ID", "map")
 
         app_user = cl.user_session.get("user")
         langgraph_user_id = app_user.identifier if app_user else "anon"
-        thread_id = cl.user_session.get("id") or str(uuid.uuid4())
+        # thread_id = cl.user_session.get("id") or str(uuid.uuid4())
+        session_id = cl.user_session.get("id") or "default"
+        thread_id = f"{langgraph_user_id}_{session_id}"
+
+        cl.user_session.set("thread_id", thread_id)
+        cl.user_session.set("langgraph_user_id", langgraph_user_id)
 
         store_cm = AsyncPostgresStore.from_conn_string(
             pg_conn,
-            index={"dims": 1536, "embed": "openai:text-embedding-3-small"}
+            # index={"dims": 1536, "embed": "openai:text-embedding-3-small"},
+            index={"dims": 768, "embed": "google_vertexai:text-embedding-004"},
         )
+
         store = await store_cm.__aenter__()
+        # await store.setup()
 
         ckpt_cm = AsyncPostgresSaver.from_conn_string(pg_conn)
+
         checkpointer = await ckpt_cm.__aenter__()
+        # await checkpointer.setup()
 
         repo = BenefitsRepo(pg_conn)
         await repo.open()  # <-- important: explicitly open the pool
@@ -82,12 +120,20 @@ async def on_chat_start():
 
         agent = await build_agent(pg_conn, repo, checkpointer, store)
         cl.user_session.set("agent", agent)
-        cl.user_session.set("config_base", {"configurable": {"langgraph_user_id": langgraph_user_id, "thread_id": thread_id}})
+        cl.user_session.set(
+            "config_base",
+            {
+                "configurable": {
+                    "langgraph_user_id": langgraph_user_id,
+                    "thread_id": thread_id,
+                }
+            },
+        )
         cl.user_session.set("store_cm", store_cm)
         cl.user_session.set("ckpt_cm", ckpt_cm)
 
         await cl.Message(
-            content="Hi! 👋 I’m your **Mazaya Benefits Agent**.\nAsk about offers by city/category/provider, or say *recommend me something* to use your saved preferences.",
+            content="Hi! 👋 I'm your **Mazaya Benefits Agent**.\nAsk about offers by city/category/provider, or say *recommend me something* to use your saved preferences.",
             author="Saudia",
         ).send()
 
@@ -95,18 +141,80 @@ async def on_chat_start():
         await cl.Message(content=f"Init error: {e}").send()
         traceback.print_exc()
 
+
+@cl.on_chat_resume
+async def on_chat_resume(thread: cl.types.ThreadDict):
+    """
+    When a user resumes a chat, reload their session history from Vertex AI
+    and display both user and assistant messages in the UI.
+    """
+    langgraph_user_id = cl.user_session.get("langgraph_user_id")
+    thread_id = cl.user_session.get("thread_id")
+
+    cl.user_session.set(
+        "config_base",
+        {
+            "configurable": {
+                "langgraph_user_id": langgraph_user_id,
+                "thread_id": thread_id,
+            }
+        },
+    )
+
+    pg_conn = os.getenv(
+        "PG_CONN",
+    )
+
+    store_cm = AsyncPostgresStore.from_conn_string(
+        pg_conn,
+        # index={"dims": 1536, "embed": "openai:text-embedding-3-small"},
+        index={"dims": 768, "embed": "google_vertexai:text-embedding-004"},
+    )
+
+    store = await store_cm.__aenter__()
+    # await store.setup()
+
+    ckpt_cm = AsyncPostgresSaver.from_conn_string(pg_conn)
+
+    checkpointer = await ckpt_cm.__aenter__()
+    # await checkpointer.setup()
+
+    repo = BenefitsRepo(pg_conn)
+    await repo.open()  # <-- important: explicitly open the pool
+    cl.user_session.set("repo", repo)
+
+    agent = await build_agent(pg_conn, repo, checkpointer, store)
+    cl.user_session.set("agent", agent)
+
+    cl.user_session.set("store_cm", store_cm)
+    cl.user_session.set("ckpt_cm", ckpt_cm)
+
+
 @cl.password_auth_callback
 def auth_callback(username: str, password: str):
-    if (username, password) == ("admin", "admin"):
-        return cl.User(identifier="admin", metadata={"role": "admin", "provider": "credentials"})
-    return None
+    # if (username, password) == ("admin", "admin"):
+    return cl.User(
+        identifier=username, metadata={"role": username, "provider": "credentials"}
+    )
+    # return None
+
+
+@cl.data_layer
+def get_data_layer():
+    """
+    Establish SQLAlchemy-based data layer for persisting chat history into PostgreSQL.
+    """
+    return SQLAlchemyDataLayer(conninfo=os.getenv("DATABASE_URL"))
+
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    agent  = cl.user_session.get("agent")
+    agent = cl.user_session.get("agent")
     config = cl.user_session.get("config_base")
     if agent is None:
-        await cl.Message(content="Agent not initialized. Please /restart the chat.").send()
+        await cl.Message(
+            content="Agent not initialized. Please /restart the chat."
+        ).send()
         return
 
     ai_msg = cl.Message(content="", author="Saudia")
@@ -122,7 +230,8 @@ async def on_message(message: cl.Message):
         return tcc.get("id") or f"idx:{tcc.get('index', 0)}:step:{step_no}"
 
     async def _open_tool_step(tc_id: str, name: str, seed_args: str = ""):
-        if tc_id in open_steps: return
+        if tc_id in open_steps:
+            return
         cm = cl.Step(name=f"🔧 {name or 'tool'}", type="tool")
         step = await cm.__aenter__()
         step.input = _pretty_json_text(seed_args)
@@ -152,21 +261,26 @@ async def on_message(message: cl.Message):
                 step_no = meta.get("langgraph_step", 0)
 
                 if isinstance(msg_chunk, AIMessageChunk):
-                    for tc in (getattr(msg_chunk, "tool_calls", []) or []):
+                    for tc in getattr(msg_chunk, "tool_calls", []) or []:
                         name = tc.get("name") or tc.get("function", {}).get("name")
                         tc_id = tc.get("id")
-                        idx   = tc.get("index", None)
-                        if not (name and tc_id): continue
+                        idx = tc.get("index", None)
+                        if not (name and tc_id):
+                            continue
                         if idx is not None:
                             idx_key = f"idx:{idx}:step:{step_no}"
                             if idx_key in arg_buffers:
-                                arg_buffers[tc_id] = arg_buffers.get(tc_id, "") + arg_buffers.pop(idx_key)
+                                arg_buffers[tc_id] = arg_buffers.get(
+                                    tc_id, ""
+                                ) + arg_buffers.pop(idx_key)
                         seed = arg_buffers.get(tc_id, "")
                         await _open_tool_step(tc_id, name, seed_args=seed)
 
-                    for tcc in (getattr(msg_chunk, "tool_call_chunks", []) or []):
+                    for tcc in getattr(msg_chunk, "tool_call_chunks", []) or []:
                         key = _key_for_chunk(tcc, step_no)
-                        arg_buffers[key] = arg_buffers.get(key, "") + (tcc.get("args") or "")
+                        arg_buffers[key] = arg_buffers.get(key, "") + (
+                            tcc.get("args") or ""
+                        )
                         tc_id = tcc.get("id")
                         if tc_id and tc_id in open_steps:
                             _, step = open_steps[tc_id]
@@ -177,18 +291,36 @@ async def on_message(message: cl.Message):
                         await ai_msg.stream_token(text)
                     elif isinstance(text, list):
                         for part in text:
-                            if isinstance(part, dict) and "text" in part and part["text"]:
+                            if (
+                                isinstance(part, dict)
+                                and "text" in part
+                                and part["text"]
+                            ):
                                 await ai_msg.stream_token(part["text"])
 
-                elif isinstance(msg_chunk, ToolMessage) or getattr(msg_chunk, "type", None) == "tool":
+                elif (
+                    isinstance(msg_chunk, ToolMessage)
+                    or getattr(msg_chunk, "type", None) == "tool"
+                ):
                     tool_name = getattr(msg_chunk, "name", None)
-                    tc_id = getattr(msg_chunk, "tool_call_id", None) or getattr(msg_chunk, "id", None)
+                    tc_id = getattr(msg_chunk, "tool_call_id", None) or getattr(
+                        msg_chunk, "id", None
+                    )
                     out = getattr(msg_chunk, "content", "")
 
-                    if tool_name in ("search_and_recommend_benefits", "recommend_benefits") and maps_key and pending_places is None:
+                    if (
+                        tool_name
+                        in ("search_and_recommend_benefits", "recommend_benefits")
+                        and maps_key
+                        and pending_places is None
+                    ):
                         try:
                             payload = json.loads(out) if isinstance(out, str) else out
-                            rows = payload.get("results", []) if isinstance(payload, dict) else []
+                            rows = (
+                                payload.get("results", [])
+                                if isinstance(payload, dict)
+                                else []
+                            )
                             queries = _build_places_queries(rows)
                             if queries:
                                 pending_places = queries
@@ -220,6 +352,7 @@ async def on_message(message: cl.Message):
         ).send(for_id=map_msg.id)
 
     await ai_msg.send()
+
 
 @cl.on_chat_end
 async def on_chat_end():

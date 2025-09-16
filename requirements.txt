@@ -1,6 +1,8 @@
 chainlit==2.5.5
 langchain-core
-langchain-openai
+# langchain-openai
+langchain-google-genai
+langchain-google-vertexai
 langgraph
 langgraph-checkpoint-sqlite
 langgraph-checkpoint-postgres
@@ -11,4 +13,5 @@ pydantic
 python-dotenv
 psycopg[binary]
 asyncpg
+google-cloud-storage
 

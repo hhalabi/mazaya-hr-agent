@@ -40,6 +40,11 @@ from langgraph.prebuilt import create_react_agent
 from langgraph.config import get_config, get_store
 from langgraph.store.postgres.aio import AsyncPostgresStore
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langchain.chat_models import init_chat_model
+import vertexai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # LangMem tools
 from langmem import create_manage_memory_tool, create_search_memory_tool
@@ -60,11 +65,27 @@ if sys.platform.startswith("win"):
     except Exception:
         pass
 
+vertexai.init(
+    project=os.getenv("GOOGLE_CLOUD_PROJECT"),
+    location=os.getenv("GOOGLE_CLOUD_LOCATION"),
+)
+
 # ---------- Constants ----------
 OFFICIAL_XLSX_COLUMNS = [
-    "OfferID", "Company Name", "Offer Name En", "Offer Name Ar",
-    "Offer Details En", "Offer Details Ar", "Effective", "Discontinue",
-    "Unlimited", "Country", "Cities", "Category En", "Category Ar", "Status"
+    "OfferID",
+    "Company Name",
+    "Offer Name En",
+    "Offer Name Ar",
+    "Offer Details En",
+    "Offer Details Ar",
+    "Effective",
+    "Discontinue",
+    "Unlimited",
+    "Country",
+    "Cities",
+    "Category En",
+    "Category Ar",
+    "Status",
 ]
 
 TABLE_NAME = "mazaya_offers_official"
@@ -72,10 +93,12 @@ TABLE_NAME = "mazaya_offers_official"
 
 # ---------- Utils ----------
 def _norm(s: Any) -> str:
-    return (str(s).strip() if s is not None else "")
+    return str(s).strip() if s is not None else ""
+
 
 def _lower(s: Any) -> str:
     return _norm(s).lower()
+
 
 def _split_tokens(txt: str) -> List[str]:
     if not txt:
@@ -85,19 +108,19 @@ def _split_tokens(txt: str) -> List[str]:
 
 # ---------- Canonical projection ----------
 def row_to_canonical(r: Dict[str, Any]) -> Dict[str, Any]:
-    offer_id  = _norm(r.get("offer_id"))
-    provider  = _norm(r.get("company_name"))
-    name_en   = _norm(r.get("offer_name_en"))
-    name_ar   = _norm(r.get("offer_name_ar"))
-    det_en    = _norm(r.get("offer_details_en"))
-    det_ar    = _norm(r.get("offer_details_ar"))
-    eff       = _norm(r.get("effective"))
-    disc      = _norm(r.get("discontinue"))
+    offer_id = _norm(r.get("offer_id"))
+    provider = _norm(r.get("company_name"))
+    name_en = _norm(r.get("offer_name_en"))
+    name_ar = _norm(r.get("offer_name_ar"))
+    det_en = _norm(r.get("offer_details_en"))
+    det_ar = _norm(r.get("offer_details_ar"))
+    eff = _norm(r.get("effective"))
+    disc = _norm(r.get("discontinue"))
     unlimited = _norm(r.get("unlimited"))
-    country   = _norm(r.get("country"))
-    cities    = _norm(r.get("cities"))
-    cat_en    = _norm(r.get("category_en"))
-    cat_ar    = _norm(r.get("category_ar"))
+    country = _norm(r.get("country"))
+    cities = _norm(r.get("cities"))
+    cat_en = _norm(r.get("category_en"))
+    cat_ar = _norm(r.get("category_ar"))
 
     rec_id = f"MZO-{offer_id or r.get('pk', '')}".strip("-")
 
@@ -105,8 +128,10 @@ def row_to_canonical(r: Dict[str, Any]) -> Dict[str, Any]:
     description = det_en if det_en else det_ar
 
     dur = []
-    if eff: dur.append(f"effective: {eff}")
-    if disc: dur.append(f"discontinue: {disc}")
+    if eff:
+        dur.append(f"effective: {eff}")
+    if disc:
+        dur.append(f"discontinue: {disc}")
     if unlimited and unlimited.lower() in ("yes", "true", "unlimited", "y", "1"):
         dur.append("unlimited")
     duration = " | ".join(dur)
@@ -119,8 +144,10 @@ def row_to_canonical(r: Dict[str, Any]) -> Dict[str, Any]:
     for city in _split_tokens(cities):
         tags_set.add(city.lower())
     name_hint = (name_en or name_ar).lower() if (name_en or name_ar) else ""
-    if "women" in name_hint or "نسائي" in name_hint: tags_set.add("women")
-    if "family" in name_hint or "عائلة" in name_hint or "أُسرة" in name_hint: tags_set.add("family")
+    if "women" in name_hint or "نسائي" in name_hint:
+        tags_set.add("women")
+    if "family" in name_hint or "عائلة" in name_hint or "أُسرة" in name_hint:
+        tags_set.add("family")
 
     return {
         "id": rec_id,
@@ -157,6 +184,7 @@ class BenefitsRepo:
         status TEXT
       );
     """
+
     def __init__(self, dsn: str):
         self.dsn = dsn
         self.pool: Optional[AsyncConnectionPool] = None
@@ -191,12 +219,15 @@ class BenefitsRepo:
         df = pd.read_excel(path, sheet_name=0, engine="openpyxl")
         cols = {c.strip() for c in df.columns}
         if not set(OFFICIAL_XLSX_COLUMNS).issubset(cols):
-            raise ValueError("Input schema not recognized. Expected official Mazaya columns.")
+            raise ValueError(
+                "Input schema not recognized. Expected official Mazaya columns."
+            )
 
         # Normalize dataframe column access to exact names
         async with await psycopg.AsyncConnection.connect(self.dsn) as con:
             async with con.cursor() as cur:
-                await cur.execute(f"""
+                await cur.execute(
+                    f"""
                     CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
                         offer_id TEXT PRIMARY KEY,
                         company_name TEXT,
@@ -208,11 +239,14 @@ class BenefitsRepo:
                         category_en TEXT, category_ar TEXT,
                         status TEXT
                     );
-                """)
+                """
+                )
                 # Upsert each row
                 for _, r in df.iterrows():
                     offer_id = r.get("OfferID")
-                    if offer_id is None or (isinstance(offer_id, float) and pd.isna(offer_id)):
+                    if offer_id is None or (
+                        isinstance(offer_id, float) and pd.isna(offer_id)
+                    ):
                         # Skip rows without a stable OfferID
                         continue
                     values = (
@@ -262,7 +296,9 @@ class BenefitsRepo:
         if self.pool is None or self.pool.closed:
             await self.open()
 
-    async def _fetch_rows(self, where_sql: str = "", args: Tuple[Any, ...] = (), limit: int = 50) -> List[Dict[str, Any]]:
+    async def _fetch_rows(
+        self, where_sql: str = "", args: Tuple[Any, ...] = (), limit: int = 50
+    ) -> List[Dict[str, Any]]:
         await self._ensure_open()
         sql = f"""
             SELECT
@@ -280,26 +316,30 @@ class BenefitsRepo:
                 rows = await cur.fetchall()
         return [row_to_canonical(r) for r in rows]
 
-    async def search(self, query: str = "", filters: Optional[Dict[str, Any]] = None, limit: int = 12) -> List[Dict[str, Any]]:
+    async def search(
+        self, query: str = "", filters: Optional[Dict[str, Any]] = None, limit: int = 12
+    ) -> List[Dict[str, Any]]:
         filters = filters or {}
         args: List[Any] = []
         parts: List[str] = []
 
         if query:
             like = f"%{query}%"
-            parts.append("""
+            parts.append(
+                """
                 (
                     offer_name_en ILIKE %s OR offer_name_ar ILIKE %s OR
                     offer_details_en ILIKE %s OR offer_details_ar ILIKE %s OR
                     company_name ILIKE %s OR category_en ILIKE %s OR category_ar ILIKE %s OR
                     cities ILIKE %s OR country ILIKE %s
                 )
-            """)
+            """
+            )
             args.extend([like, like, like, like, like, like, like, like, like])
 
-        f_cat  = _lower(filters.get("category", ""))
-        f_loc  = _lower(filters.get("location", ""))
-        f_tag  = _lower(filters.get("tag", ""))
+        f_cat = _lower(filters.get("category", ""))
+        f_loc = _lower(filters.get("location", ""))
+        f_tag = _lower(filters.get("tag", ""))
         f_prov = _lower(filters.get("provider_contains", ""))
         f_city = _lower(filters.get("city", ""))
 
@@ -316,64 +356,94 @@ class BenefitsRepo:
             parts.append("lower(company_name) ILIKE %s")
             args.append(f"%{f_prov}%")
         if f_tag:
-            parts.append("(lower(category_en) ILIKE %s OR lower(category_ar) ILIKE %s OR lower(cities) ILIKE %s)")
+            parts.append(
+                "(lower(category_en) ILIKE %s OR lower(category_ar) ILIKE %s OR lower(cities) ILIKE %s)"
+            )
             args.extend([f"%{f_tag}%", f"%{f_tag}%", f"%{f_tag}%"])
 
-        base = await self._fetch_rows(" AND ".join([p.strip() for p in parts if p.strip()]), tuple(args), limit=100)
+        base = await self._fetch_rows(
+            " AND ".join([p.strip() for p in parts if p.strip()]),
+            tuple(args),
+            limit=100,
+        )
 
         q = _lower(query)
+
         def score(rec: Dict[str, Any]) -> int:
             s = 0
-            hay = " ".join([
-                rec.get("title", ""), rec.get("description", ""), rec.get("category", ""),
-                rec.get("provider", ""), rec.get("tags", ""), rec.get("location", "")
-            ]).lower()
+            hay = " ".join(
+                [
+                    rec.get("title", ""),
+                    rec.get("description", ""),
+                    rec.get("category", ""),
+                    rec.get("provider", ""),
+                    rec.get("tags", ""),
+                    rec.get("location", ""),
+                ]
+            ).lower()
             if q:
                 for tok in [t for t in q.split() if t]:
                     if tok in hay:
                         s += 1
-            if f_city and f_city in (rec.get("_cities_raw", "") or "").lower(): s += 1
-            if f_cat and f_cat == rec.get("category", ""): s += 2
-            if f_prov and f_prov in (rec.get("provider", "") or "").lower(): s += 1
-            if f_tag and f_tag in rec.get("tags", ""): s += 2
+            if f_city and f_city in (rec.get("_cities_raw", "") or "").lower():
+                s += 1
+            if f_cat and f_cat == rec.get("category", ""):
+                s += 2
+            if f_prov and f_prov in (rec.get("provider", "") or "").lower():
+                s += 1
+            if f_tag and f_tag in rec.get("tags", ""):
+                s += 2
             return s
 
         base.sort(key=lambda r: (-score(r), r.get("title", "")))
         return base[:limit]
 
-    async def recommend(self, preferences: Dict[str, Any], limit: int = 8) -> List[Dict[str, Any]]:
+    async def recommend(
+        self, preferences: Dict[str, Any], limit: int = 8
+    ) -> List[Dict[str, Any]]:
         filters: Dict[str, Any] = {}
-        if preferences.get("city"):     filters["city"] = preferences["city"]
-        if preferences.get("location"): filters["location"] = preferences["location"]
-        candidates = await self.search(query="", filters=filters, limit=max(60, limit * 6))
+        if preferences.get("city"):
+            filters["city"] = preferences["city"]
+        if preferences.get("location"):
+            filters["location"] = preferences["location"]
+        candidates = await self.search(
+            query="", filters=filters, limit=max(60, limit * 6)
+        )
 
         pref_tags = [_lower(t) for t in preferences.get("tags", [])]
         pref_cats = [_lower(c) for c in preferences.get("categories", [])]
-        pref_loc  = _lower(preferences.get("location", ""))
+        pref_loc = _lower(preferences.get("location", ""))
         pref_city = _lower(preferences.get("city", ""))
-        disliked  = [_lower(d) for d in preferences.get("disliked", [])]
-        keywords  = [_lower(k) for k in preferences.get("keywords", [])]
+        disliked = [_lower(d) for d in preferences.get("disliked", [])]
+        keywords = [_lower(k) for k in preferences.get("keywords", [])]
 
         def score(rec: Dict[str, Any]) -> int:
             s = 0
             tags = rec.get("tags", "")
-            hay = " ".join([rec.get("title",""), rec.get("description","")]).lower()
-            if pref_tags and any(t in tags for t in pref_tags): s += 3
-            if pref_cats and rec.get("category","") in pref_cats: s += 2
-            if pref_loc and pref_loc in rec.get("location",""): s += 1
-            if pref_city and pref_city in (rec.get("_cities_raw","") or "").lower(): s += 1
-            if disliked and any(d in hay for d in disliked): s -= 2
+            hay = " ".join([rec.get("title", ""), rec.get("description", "")]).lower()
+            if pref_tags and any(t in tags for t in pref_tags):
+                s += 3
+            if pref_cats and rec.get("category", "") in pref_cats:
+                s += 2
+            if pref_loc and pref_loc in rec.get("location", ""):
+                s += 1
+            if pref_city and pref_city in (rec.get("_cities_raw", "") or "").lower():
+                s += 1
+            if disliked and any(d in hay for d in disliked):
+                s -= 2
             for k in keywords:
-                if k in hay: s += 1
+                if k in hay:
+                    s += 1
             return s
 
-        candidates.sort(key=lambda r: (-score(r), r.get("title","")))
+        candidates.sort(key=lambda r: (-score(r), r.get("title", "")))
         return candidates[:limit]
 
 
 # ---------- Long-term memory schema ----------
 class UserTraits(BaseModel):
     """Structured profile persisted long-term (via LangMem)."""
+
     name: Optional[str] = None
     role: Optional[str] = None
     department: Optional[str] = None
@@ -389,8 +459,11 @@ class UserTraits(BaseModel):
 # ---------- Tools (async, explicit docstrings) ----------
 _REPO: Optional[BenefitsRepo] = None
 
+
 @tool("search_and_recommend_benefits", return_direct=False)
-async def search_and_recommend_benefits(query: str = "", filters_json: str = "", limit: int = 12) -> str:
+async def search_and_recommend_benefits(
+    query: str = "", filters_json: str = "", limit: int = 12
+) -> str:
     """
     Search Mazaya benefits (official catalog in Postgres).
 
@@ -407,7 +480,12 @@ async def search_and_recommend_benefits(query: str = "", filters_json: str = "",
     except Exception:
         filters = {}
     rows = await _REPO.search(query=query or "", filters=filters, limit=limit)
-    return json.dumps({"results": rows, "used_filters": filters, "query": query or ""}, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {"results": rows, "used_filters": filters, "query": query or ""},
+        ensure_ascii=False,
+        indent=2,
+    )
+
 
 @tool("recommend_benefits", return_direct=False)
 async def recommend_benefits(preferences_json: str = "", limit: int = 8) -> str:
@@ -430,7 +508,10 @@ async def recommend_benefits(preferences_json: str = "", limit: int = 8) -> str:
     except Exception:
         prefs = {}
     rows = await _REPO.recommend(prefs, limit=limit)
-    return json.dumps({"results": rows, "used_prefs": prefs}, ensure_ascii=False, indent=2)
+    return json.dumps(
+        {"results": rows, "used_prefs": prefs}, ensure_ascii=False, indent=2
+    )
+
 
 @tool("remember_traits", return_direct=False)
 async def remember_traits(json_payload: str) -> str:
@@ -453,7 +534,12 @@ async def remember_traits(json_payload: str) -> str:
     elif current and isinstance(current.value, dict):
         merged = current.value
     merged.update(data)
-    await store.aput(ns, "profile", {"content": merged}, index={"text": json.dumps(merged, ensure_ascii=False)})
+    await store.aput(
+        ns,
+        "profile",
+        {"content": merged},
+        index={"text": json.dumps(merged, ensure_ascii=False)},
+    )
     return "Saved."
 
 
@@ -471,43 +557,111 @@ def system_prompt_with_memories(state: Dict[str, Any]):
     except Exception:
         memories_text = ""
 
-    rules = f"""
-You are the **Mazaya Benefits Agent** for Saudia Airlines' employee benefits (Mazaya).
+    system_msg = f"""
+        You are a helpful Employee Benefits Assistant (Mazaya Agent). Your goal is to help employees discover the best offers and discounts available in the Mazaya program.
 
-Instructions:
-1) Always start by loading the user's profile via the create_search_memory_tool. If no profile exists, ask up short questions to gather preferences. If a profile exists, welcome the user back and use their preferences and remind them what you know about them.
-2) For explicit queries, call `search_and_recommend_benefits` with appropriate filters.
-3) Be concise and explain *why* each recommendation matches preferences.
-4) Create or update the user's profile via the create_manage_memory_tool, especially after learning new stable traits/preferences.
+        ### Instructions
+        1. **Greeting**
+        - Greet the user once at the start of the session:
+            "Hello! I'm your Mazaya Employee Benefits Assistant. I can help you explore amazing discounts and offers."
+        - Do NOT repeat greetings in later responses.
 
-When using search_and_recommend_benefits, keep in mind that those are the available categories: ["Automotive Sales", "Car Rentals", "Education", "Electronics", "Entertainment", "Fashion & Apparel", "Financial Offers", "Fitness", "Furniture", "General Services", "Hotels", "Maintenance", "Medical & Health", "Real Estate", "Restaurants", "Women's Care"].
+        2. **Personalization Onboarding**
+        - At the start, check for user preferences in memory.
+        - If no preferences exist, ask if they want to personalize.
+        - If yes, ask 2-3 short questions:
+            1. City/country
+            2. Categories of interest
+            3. Optional: short-term vs long-term deals
+        - If preferences already exist in memory:
+            - Do NOT list them back explicitly.
+            - Use them implicitly in responses (e.g. if user is in Riyadh, say "I can help you explore amazing discounts and offers in Riyadh").
+        
+        3. **Mazaya Offer Categories**
+        ["Restaurants", "Hotels", "Car Rentals", "Furniture", "Automotive Sales", "Maintenance", "Education", "Fitness", "Electronics", "Medical & Health", "Entertainment", "Fashion & Apparel", "Women's Care", "Financial Offers", "General Services", "Real Estate"]
+            
+        4. **Responding to Queries**
+        - For Mazaya offers, call `search_and_recommend_benefits` with appropriate filters.
+        - Do not invent offers.
+        - Always require at least:
+            - **Category** (e.g., Restaurants, Hotels, Fitness, etc.)
+            - And **City or Country**
+        - If the user only provides a city:
+            - Check if the data has a matching city.
+            - If the data instead has **"All KSA"** for that offer:
+                - Treat it as valid and respond with those offers (but make it clear to the user).
+                - Example:  
+                    "I couldn't find offers specific to Riyadh, but here are offers available across **all of Saudi Arabia**."
+        - Ask clarifying questions if the request is vague.
+        - Show top 3-5 offers based on highest discount and user preferences, formatted as a bulleted list with:
+            - Offer Name
+            - Offer Details (**highlight discounts in bold**)
+            - Location
+            - Duration (either start - end date or Unlimited)
+            - Status
 
-<LONG_TERM_MEMORY_JSON>
-{memories_text}
-</LONG_TERM_MEMORY_JSON>
-""".strip()
+        - If no offers are available, ask if they want to search another category or location.
 
-    return [{"role": "system", "content": rules}, *state["messages"]]
+        5. **Memory**
+        - Save user preferences, personal info, and interests to long-term memory.
+        - **Whenever the user shares a new category, city, country, or preference**:
+            - Add it to long-term memory.
+            - Do not delete or overwrite earlier preferences unless the user explicitly says to update/remove them.
+            - Treat long-term memory as a growing profile of the user's interests.
+
+        6. **Communication Guidelines**
+        - Be concise, professional, and friendly.
+        - Ask at most 1-2 short questions at a time.
+        - After a tool call, provide a final summarized answer and stop reasoning further.
+
+        ### Goal
+        Make it easy and enjoyable for employees to discover the most relevant offers, even if they don't know exactly what to ask for.
+        
+        <LONG_TERM_MEMORY_JSON>
+        {memories_text}
+        </LONG_TERM_MEMORY_JSON>
+        """
+
+    return [{"role": "system", "content": system_msg}, *state["messages"]]
 
 
 # ---------- Build agent ----------
-async def build_agent(pg_conn: str, repo: BenefitsRepo, checkpointer: AsyncPostgresSaver, store: AsyncPostgresStore):
+async def build_agent(
+    pg_conn: str,
+    repo: BenefitsRepo,
+    checkpointer: AsyncPostgresSaver,
+    store: AsyncPostgresStore,
+):
     global _REPO
     _REPO = repo
 
+    # await store.setup()
+    # await checkpointer.setup()
+
     manage_memory_tool = create_manage_memory_tool(
-        namespace=("memories", "{langgraph_user_id}", "profile"),
-        schema=UserTraits
+        namespace=("memories", "{langgraph_user_id}", "profile"), schema=UserTraits
     )
     search_memory_tool = create_search_memory_tool(
         namespace=("memories", "{langgraph_user_id}")
     )
 
-    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3, streaming=True)
+    # llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0.3, streaming=True)
+    llm = init_chat_model(
+        "gemini-2.5-flash",
+        model_provider="google_genai",
+        temperature=0.2,
+    )
 
     agent = create_react_agent(
         llm,
-        tools=[search_and_recommend_benefits, manage_memory_tool, search_memory_tool],
+        tools=[
+            search_and_recommend_benefits,
+            create_manage_memory_tool(
+                namespace=("memories", "{langgraph_user_id}", "profile"),
+                # schema=UserTraits,
+            ),
+            create_search_memory_tool(namespace=("memories", "{langgraph_user_id}")),
+        ],
         prompt=system_prompt_with_memories,
         store=store,
         checkpointer=checkpointer,
@@ -520,7 +674,11 @@ async def run_cli(pg_conn: str, user_id: str, thread_id: str, stream: bool):
     repo = BenefitsRepo(pg_conn)
     await repo.open()
 
-    store_cm = AsyncPostgresStore.from_conn_string(pg_conn, index={"dims": 1536, "embed": "openai:text-embedding-3-small"})
+    store_cm = AsyncPostgresStore.from_conn_string(
+        pg_conn,
+        # index={"dims": 1536, "embed": "openai:text-embedding-3-small"},
+        index={"dims": 768, "embed": "google_vertexai:text-embedding-004"},
+    )
     ckpt_cm = AsyncPostgresSaver.from_conn_string(pg_conn)
 
     store = await store_cm.__aenter__()
@@ -539,7 +697,9 @@ async def run_cli(pg_conn: str, user_id: str, thread_id: str, stream: bool):
             if not user:
                 continue
 
-            config = {"configurable": {"langgraph_user_id": user_id, "thread_id": thread_id}}
+            config = {
+                "configurable": {"langgraph_user_id": user_id, "thread_id": thread_id}
+            }
             print("\nAgent: ", end="", flush=True)
 
             async for msg_chunk, meta in agent.astream(
@@ -568,9 +728,16 @@ async def _amain():
     parser = argparse.ArgumentParser()
     parser.add_argument("--user-id", default="anon")
     parser.add_argument("--thread-id", default="default")
-    parser.add_argument("--pg-conn", default=os.getenv("PG_CONN", "postgresql://postgres:%254~K%5D%3BUAJCjL%7D%3CA%3B@34.166.107.36:5432/mazayamem?sslmode=require"))
+    parser.add_argument(
+        "--pg_conn",
+        default=os.getenv(
+            "PG_CONN",
+        ),
+    )
     parser.add_argument("--stream", action="store_true")
-    parser.add_argument("--import_xlsx", help="Path to official Mazaya XLSX to import, then exit")
+    parser.add_argument(
+        "--import_xlsx", help="Path to official Mazaya XLSX to import, then exit"
+    )
     args = parser.parse_args()
 
     if args.import_xlsx:
@@ -581,6 +748,7 @@ async def _amain():
         return
 
     await run_cli(args.pg_conn, args.user_id, args.thread_id, args.stream)
+
 
 if __name__ == "__main__":
     asyncio.run(_amain())

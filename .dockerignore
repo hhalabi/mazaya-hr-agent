@@ -8,4 +8,5 @@ __pycache__
 *.db
 # Keep Active.xlsx since the app defaults to it
 # Active.xlsx
+env.txt
 
